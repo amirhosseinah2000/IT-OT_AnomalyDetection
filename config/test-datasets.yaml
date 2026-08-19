@@ -1,0 +1,33 @@
+# Ready-to-run inventory for the files currently present in this repository.
+# Every CSV is a candidate only; inspect mapping results before using labels.
+data:
+  protocol_folders:
+    - id: dns-observation
+      protocol: dns
+      domain: it
+      labels:
+        - DNS_Spoofing.pcap_Flow.csv
+
+    - id: http-observation
+      protocol: http
+      domain: it
+      labels:
+        - DDoS-HTTP_Flood_1.csv
+        - DoS-HTTP_Flood1.pcap_Flow.csv
+        - BrowserHijacking_1.csv
+
+    - id: modbus-observation
+      protocol: modbus
+      domain: ot
+      labels:
+        - Schneider_fraggle_faster_0710_01_.csv
+
+    - id: s7comm-observation
+      protocol: s7comm
+      domain: ot
+      labels:
+        - Siemens_teardrop_0709.csv
+
+# `tls.pcap.pcapng` is intentionally not in this inventory. It is not one of
+# the Phase 1 supported protocols (SSH, DNS, HTTP, Modbus, S7comm), and no
+# SSH-specific PCAP is currently available under data/raw/pcap.

@@ -1,0 +1,30 @@
+[theme]
+base = "dark"
+primaryColor = "#38BDF8"
+backgroundColor = "#07111F"
+secondaryBackgroundColor = "#10233B"
+textColor = "#E2E8F0"
+borderColor = "#24466D"
+linkColor = "#7DD3FC"
+font = "sans-serif"
+codeFont = "monospace"
+baseFontSize = 15
+baseRadius = "large"
+buttonRadius = "large"
+showWidgetBorder = true
+showSidebarBorder = true
+chartCategoricalColors = ["#38BDF8", "#818CF8", "#34D399", "#F59E0B", "#FB7185", "#22D3EE", "#C084FC"]
+chartSequentialColors = ["#E0F2FE", "#BAE6FD", "#7DD3FC", "#38BDF8", "#0EA5E9", "#0284C7", "#0369A1", "#075985", "#0C4A6E", "#082F49"]
+
+[theme.sidebar]
+backgroundColor = "#091525"
+secondaryBackgroundColor = "#10233B"
+textColor = "#E2E8F0"
+borderColor = "#24466D"
+primaryColor = "#38BDF8"
+
+[server]
+maxUploadSize = 500
+
+[browser]
+gatherUsageStats = false

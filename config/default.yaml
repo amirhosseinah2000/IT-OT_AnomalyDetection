@@ -1,0 +1,118 @@
+# Central configuration for all Phase 1 commands. Copy it before changing defaults.
+project:
+  artifact_dir: artifacts
+  random_seed: 42
+  timezone: UTC
+
+data:
+  # Repository-relative defaults. CLI input paths always take precedence for ad hoc runs.
+  raw_pcap_dir: data/raw/pcap
+  it_label_dir: data/raw/labels/it
+  ot_label_dir: data/raw/labels/ot
+  interim_dir: data/interim
+  processed_dir: data/processed
+  # Preferred ingestion: create one folder per protocol below raw_pcap_dir
+  # (for example `pcap/modbus/`) and place any number of PCAP/PCAPNG files in it.
+  # With no configuration, `pipeline run` discovers supported protocol folders automatically.
+  # Use this list only to attach label files or override a folder/domain.
+  protocol_folders: []
+  # Legacy one-file-at-a-time inventory. Keep empty when using protocol folders.
+  # PCAP and label paths may be absolute or relative to their configured roots.
+  datasets: []
+  # Example:
+  # - protocol: modbus
+  #   folder: modbus
+  #   domain: ot
+  #   labels: [candidate-labels-1.csv, candidate-labels-2.csv]
+
+runtime:
+  execution_device: cpu
+  cpu_workers: 0              # 0 means use all logical CPUs minus one.
+  memory_limit_gb: 48         # Soft guardrail; keep below installed RAM.
+  batch_size: 50000
+  progress_refresh_seconds: 1
+
+capture:
+  supported_protocols: [ssh, dns, http, modbus, s7comm]
+  flow_idle_timeout_seconds: 60
+  behavior_window_seconds: 60
+  default_interface: null
+  tcpreplay:
+    enabled: false
+    binary: tcpreplay
+    interface: null
+    multiplier: 1.0
+
+mapping:
+  timestamp_tolerance_seconds: 5.0
+  timestamp_dayfirst: true
+  allow_reverse_flow_match: true
+  default_label: unknown
+  it:
+    label_columns: [Label, Attack Name, Category]
+    flow_id_columns: [Flow ID, FlowID]
+    timestamp_columns: [Timestamp, timestamp]
+    source_ip_columns: [Src IP, src_ip]
+    destination_ip_columns: [Dst IP, dst_ip]
+    source_port_columns: [Src Port, src_port]
+    destination_port_columns: [Dst Port, dst_port]
+  ot:
+    label_columns: [state, Label, label]
+    start_columns: [startDate, start, timestamp]
+    end_columns: [endDate, end]
+    source_ip_columns: [sIPs, sAddress, src_ip]
+    destination_ip_columns: [rIPs, rAddress, dst_ip]
+
+features:
+  missing_numeric_value: -1.0
+  high_cardinality_max_categories: 50
+  default_profile: all_features
+
+preprocessing:
+  numeric_scaler: robust
+  categorical_encoder: onehot
+  min_non_null_ratio: 0.05
+
+models:
+  contamination: 0.05
+  train_split: 0.8
+  # `temporal` keeps later traffic out of the fit partition, which is required
+  # for sequence-aware LSTM validation. Use `random` only for i.i.d. studies.
+  split_strategy: temporal
+  candidates: [isolation_forest, local_outlier_factor, one_class_svm, pca_autoencoder, lstm_autoencoder]
+  isolation_forest:
+    n_estimators: 300
+    max_samples: auto
+  local_outlier_factor:
+    n_neighbors: 35
+  one_class_svm:
+    nu: 0.05
+    gamma: scale
+  pca_autoencoder:
+    explained_variance: 0.95
+  lstm_autoencoder:
+    # Windows preserve packet/flow order within a protocol or deployment group.
+    sequence_length: 16
+    sequence_stride: 16
+    hidden_size: 32
+    latent_size: 16
+    num_layers: 1
+    dropout: 0.0
+    learning_rate: 0.001
+    batch_size: 256
+    epochs: 20
+    validation_fraction: 0.15
+    patience: 5
+    # Caps fit cost while score generation still covers every held-out record.
+    max_train_windows: 5000
+    device: cpu
+
+feature_evaluation:
+  # Runs independently of CSV mapping and never consumes CSV labels.
+  enabled: true
+  detectors: [isolation_forest, pca_autoencoder, lstm_autoencoder]
+  strategy: grouped
+  group: all
+  # `all_features` is always included. Add dashboard/CLI profile names here to
+  # compare the same detectors using selected subsets, for example: [compact-it].
+  selected_profiles: []
