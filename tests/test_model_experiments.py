@@ -25,11 +25,10 @@ def _config(tmp_path) -> dict:
             "contamination": 0.1,
             "train_split": 0.75,
             "split_strategy": "temporal",
-            "candidates": ["isolation_forest", "pca_autoencoder", "lstm_autoencoder"],
+            "candidates": ["isolation_forest", "lstm_autoencoder"],
             "isolation_forest": {"n_estimators": 10, "max_samples": "auto"},
             "local_outlier_factor": {"n_neighbors": 5},
             "one_class_svm": {"nu": 0.1, "gamma": "scale"},
-            "pca_autoencoder": {"explained_variance": 0.95},
             "lstm_autoencoder": {
                 "sequence_length": 4,
                 "sequence_stride": 4,
@@ -75,13 +74,13 @@ def test_profile_experiment_writes_baseline_and_selected_comparison(tmp_path) ->
         group="all",
         profiles=[profile],
         output_dir=tmp_path / "experiment",
-        candidates=["isolation_forest", "pca_autoencoder"],
+        candidates=["isolation_forest"],
     )
 
     assert set(comparison["feature_profile"]) == {"all_features", str(profile)}
-    assert set(comparison["model"]) == {"isolation_forest", "pca_autoencoder"}
+    assert set(comparison["model"]) == {"isolation_forest"}
     assert (tmp_path / "experiment" / "comparison.parquet").exists()
-    assert len(list((tmp_path / "experiment").rglob("feature-importance.parquet"))) == 6
+    assert len(list((tmp_path / "experiment").rglob("feature-importance.parquet"))) == 4
     assert summary["successful_profiles"] == 2
 
 
@@ -91,6 +90,7 @@ def test_lstm_autoencoder_scores_and_persists_history_when_torch_is_available(tm
     from anomdet.modelling.lstm_autoencoder import LSTMAutoencoder
 
     values = np.random.default_rng(42).normal(size=(48, 3)).astype(np.float32)
+    events: list[dict[str, object]] = []
     model = LSTMAutoencoder(
         sequence_length=6,
         sequence_stride=6,
@@ -100,8 +100,12 @@ def test_lstm_autoencoder_scores_and_persists_history_when_torch_is_available(tm
         epochs=2,
         patience=2,
         max_train_windows=20,
-    ).fit(values)
+    ).fit(values, progress_callback=events.append)
 
     assert len(model.score_samples(values)) == len(values)
     assert len(model.training_history_) >= 1
+    epoch_events = [event for event in events if event["event"] == "epoch"]
+    assert len(epoch_events) == len(model.training_history_)
+    assert events[0]["event"] == "lstm_started"
+    assert events[-1]["event"] == "lstm_completed"
     assert model.save(tmp_path / "model.pt").exists()

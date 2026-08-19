@@ -85,7 +85,7 @@ artifacts/runs/<run-id>/
       lstm-sweep/sweep-comparison.parquet
 ```
 
-`comparison.parquet` is the integration-friendly model summary. Important fields include `feature_profile`, `scope`, `protocols`, `model`, `input_features`, `training_rows`, `test_rows`, `fit_seconds`, `process_memory_delta_mb`, score mean and percentiles, anomaly rate, and, when validated labels are supplied, ROC-AUC and average precision. PCA AE and LSTM AE also persist `reconstruction_mse_mean` and `reconstruction_rmse`; the per-record `anomaly_score` for these detectors is reconstruction MSE.
+`comparison.parquet` is the integration-friendly model summary. Important fields include `feature_profile`, `scope`, `protocols`, `model`, `input_features`, `training_rows`, `test_rows`, `fit_seconds`, `process_memory_delta_mb`, score mean and percentiles, anomaly rate, and, when validated labels are supplied, ROC-AUC and average precision. LSTM AE persists `reconstruction_mse_mean` and `reconstruction_rmse`; its per-record `anomaly_score` is reconstruction MSE. PCA is retained only for reading legacy artefacts and is not a new-training candidate.
 
 Every LSTM AE run additionally persists:
 
@@ -102,7 +102,7 @@ Other detectors persist `model.joblib`, and all detectors persist scores, metric
 uv run anomaly extract D:/network-data/pcap/modbus --output artifacts/features/modbus.parquet
 uv run anomaly select analyze artifacts/features/modbus.parquet --output artifacts/reports/modbus-quality.parquet
 uv run anomaly select create modbus-operations --features packet_length,flow_duration,modbus_function_code,modbus_quantity
-uv run anomaly train artifacts/features/modbus.parquet --profile modbus-operations --strategy per_protocol --models isolation_forest,pca_autoencoder,lstm_autoencoder
+uv run anomaly train artifacts/features/modbus.parquet --profile modbus-operations --strategy per_protocol --models isolation_forest,lstm_autoencoder
 
 # Configured multi-capture run.
 uv run anomaly --config config/lab.yaml pipeline run --output artifacts/runs/lab-01
@@ -126,14 +126,14 @@ comparison, manifest = run_feature_experiments(
     group="all",
     profiles=["modbus-operations"],
     output_dir=Path("artifacts/runs/lab-01/experiments/integration-01"),
-    candidates=["isolation_forest", "pca_autoencoder", "lstm_autoencoder"],
+    candidates=["isolation_forest", "lstm_autoencoder"],
     model_overrides={
         "lstm_autoencoder": {
-            "sequence_length": 16,
-            "sequence_stride": 16,
-            "hidden_size": 32,
-            "latent_size": 16,
-            "epochs": 20,
+            "sequence_length": 10,
+            "sequence_stride": 10,
+            "hidden_size": 128,
+            "latent_size": 64,
+            "epochs": 100,
         }
     },
 )

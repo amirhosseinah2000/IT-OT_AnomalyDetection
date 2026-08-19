@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -177,8 +178,12 @@ class LSTMAutoencoder:
             return requested
         return "cpu"
 
-    def fit(self, values: np.ndarray) -> LSTMAutoencoder:
-        """Fit the reconstruction model and retain an epoch-level loss history."""
+    def fit(
+        self,
+        values: np.ndarray,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> LSTMAutoencoder:
+        """Fit the reconstruction model and optionally report epoch-level live progress."""
         torch, _nn = _torch_modules()
         windows, _starts = self._windows(values)
         sampled = self._evenly_sample(windows, self.max_train_windows)
@@ -211,6 +216,17 @@ class LSTMAutoencoder:
         best_state: dict[str, Any] | None = None
         stalled_epochs = 0
         history: list[dict[str, float | int | None]] = []
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "event": "lstm_started",
+                    "epochs": self.epochs,
+                    "training_windows": len(training),
+                    "validation_windows": len(validation) if validation is not None else 0,
+                    "sequence_length": int(training.shape[1]),
+                    "input_features": int(training.shape[2]),
+                }
+            )
 
         for epoch in range(1, self.epochs + 1):
             model.train()
@@ -236,22 +252,25 @@ class LSTMAutoencoder:
                         loss_function(model(validation_tensor), validation_tensor).item()
                     )
             monitor = validation_loss if validation_loss is not None else training_loss
-            history.append(
-                {
-                    "epoch": epoch,
-                    "train_loss": training_loss,
-                    "validation_loss": validation_loss,
-                    "learning_rate": self.learning_rate,
-                }
-            )
             if monitor < best_loss - 1e-8:
                 best_loss = monitor
                 best_state = deepcopy(model.state_dict())
                 stalled_epochs = 0
             else:
                 stalled_epochs += 1
-                if stalled_epochs >= self.patience:
-                    break
+            history_entry = {
+                "epoch": epoch,
+                "train_loss": training_loss,
+                "validation_loss": validation_loss,
+                "learning_rate": self.learning_rate,
+                "best_loss": best_loss,
+                "stalled_epochs": stalled_epochs,
+            }
+            history.append(history_entry)
+            if progress_callback is not None:
+                progress_callback({"event": "epoch", "epochs": self.epochs, **history_entry})
+            if stalled_epochs >= self.patience:
+                break
 
         if best_state is not None:
             model.load_state_dict(best_state)
@@ -261,6 +280,16 @@ class LSTMAutoencoder:
         self.effective_sequence_length_ = int(training.shape[1])
         self.device_ = resolved_device
         self.training_history_ = history
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "event": "lstm_completed",
+                    "epochs": self.epochs,
+                    "epochs_completed": len(history),
+                    "best_loss": best_loss,
+                    "stopped_early": len(history) < self.epochs,
+                }
+            )
         return self
 
     def score_samples(self, values: np.ndarray) -> np.ndarray:

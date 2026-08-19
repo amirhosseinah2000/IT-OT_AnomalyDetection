@@ -628,6 +628,7 @@ def extract_pcap_features(
         "max_packets_per_capture": max_packets,
         "output": str(output_path),
         "rows": len(features),
+        "flow_count": int(features["flow_id"].nunique(dropna=True)) if not features.empty else 0,
         "protocol_counts": features["protocol"].value_counts(dropna=False).to_dict()
         if not features.empty
         else {},

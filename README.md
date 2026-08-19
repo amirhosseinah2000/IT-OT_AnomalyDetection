@@ -23,7 +23,7 @@ uv run anomaly --help
 uv run anomaly resources
 uv run anomaly extract capture.pcap --output artifacts/features/capture.parquet
 uv run anomaly select create baseline --features packet_length,flow_duration,packet_rate
-uv run anomaly train artifacts/features/capture.parquet --strategy per_protocol --models isolation_forest,pca_autoencoder,lstm_autoencoder
+uv run anomaly train artifacts/features/capture.parquet --strategy per_protocol --models isolation_forest,lstm_autoencoder
 uv run anomaly dashboard
 ```
 
@@ -100,7 +100,7 @@ Use these commands when diagnosing a single stage rather than executing the full
 | Analyze extracted-feature quality | `uv run anomaly select analyze artifacts/features/modbus.parquet` |
 | Create a selected-feature profile | `uv run anomaly select create compact-it --features packet_length,payload_entropy,flow_duration,packet_rate` |
 | Prepare a selected matrix | `uv run anomaly prepare artifacts/features/modbus.parquet --profile compact-it` |
-| Train an individual unsupervised comparison | `uv run anomaly train artifacts/features/modbus.parquet --profile compact-it --strategy per_protocol --models isolation_forest,pca_autoencoder,lstm_autoencoder` |
+| Train an individual unsupervised comparison | `uv run anomaly train artifacts/features/modbus.parquet --profile compact-it --strategy per_protocol --models isolation_forest,lstm_autoencoder` |
 | Run the configured inventory | `uv run anomaly --config config/test-datasets.yaml pipeline run --output artifacts/runs/full-test-01` |
 | Start the dashboard | `uv run anomaly dashboard` |
 
@@ -130,7 +130,7 @@ Open `http://127.0.0.1:8501` in the browser. In the sidebar, set **Artifact dire
 artifacts/runs/full-test-01
 ```
 
-Choose the pipeline run in the sidebar. The dashboard automatically reads its combined feature table and separates all views by **protocol**, not by individual feature filenames. **Experiment studio** runs configured ingestion, creates multiple immutable feature profiles, launches profile comparisons, and can execute LSTM parameter sweeps. **Results explorer** provides protocol feature guides, EDA, model/profile comparisons, feature contribution, LSTM training curves, mapping audit, and runtime evidence.
+Choose the pipeline run and then the protocol in the sidebar. The dashboard reads the matching protocol feature table first rather than loading the combined multi-GB table, displays an audit of every included PCAP, and separates all views by **protocol**. **Experiment studio** runs configured ingestion, creates multiple immutable feature profiles, launches profile comparisons, and can execute LSTM parameter sweeps. **Results explorer** provides protocol feature guides, EDA, model/profile comparisons, feature contribution, LSTM training curves, mapping audit, and runtime evidence. See the [Persian dashboard guide](docs/DASHBOARD_GUIDE_FA.md) for every control and table column.
 
 ## Operational notes
 

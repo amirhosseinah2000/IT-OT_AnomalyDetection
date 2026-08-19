@@ -73,3 +73,37 @@ def test_robust_preparation_scales_sparse_zero_feature(tmp_path) -> None:
     prepared, _manifest, _pipeline = prepare_features(source_path, output_path, config)
 
     assert prepared["flow_total_bytes"].abs().max() < 20
+
+
+def test_per_protocol_default_excludes_foreign_schema_features(tmp_path) -> None:
+    """The all-features baseline must respect the selected protocol's catalogue."""
+    config = {
+        "project": {"artifact_dir": str(tmp_path / "artifacts")},
+        "features": {"high_cardinality_max_categories": 50},
+        "preprocessing": {
+            "min_non_null_ratio": 0.05,
+            "numeric_scaler": "robust",
+            "categorical_encoder": "onehot",
+        },
+    }
+    source = pd.DataFrame(
+        {
+            "flow_id": ["a", "b", "c", "d"],
+            "protocol": ["modbus"] * 4,
+            "packet_length": [60, 72, 64, 80],
+            "modbus_quantity": [1, 2, 3, 4],
+            "dns_rcode": [0, 0, 0, 0],
+            "http_status_code": [0, 0, 0, 0],
+        }
+    )
+    source_path = tmp_path / "mixed-schema.parquet"
+    output_path = tmp_path / "modbus-prepared.parquet"
+    source.to_parquet(source_path, index=False)
+
+    _prepared, manifest, _pipeline = prepare_features(
+        source_path, output_path, config, protocols=["modbus"]
+    )
+
+    assert "modbus_quantity" in manifest["selected_input_features"]
+    assert "dns_rcode" not in manifest["selected_input_features"]
+    assert "http_status_code" not in manifest["selected_input_features"]

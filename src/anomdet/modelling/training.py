@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +22,6 @@ from sklearn.svm import OneClassSVM
 
 from anomdet.core.io import read_table, utc_now, write_json, write_table
 from anomdet.core.resources import effective_workers
-from anomdet.modelling.detectors import PCAAutoencoder
 from anomdet.modelling.lstm_autoencoder import LSTMAutoencoder
 from anomdet.preprocessing.pipeline import prepare_features
 
@@ -30,6 +30,18 @@ METADATA_COLUMNS = {"row_id", "label", "protocol", "flow_id", "timestamp", "capt
 IT_PROTOCOLS = ["ssh", "dns", "http"]
 OT_PROTOCOLS = ["modbus", "s7comm"]
 NORMAL_LABELS = {"benign", "normal", "0", "false", "no", "non-anomaly", "non_anomaly"}
+
+
+def _emit_progress(
+    progress_callback: Callable[[dict[str, Any]], None] | None, payload: dict[str, Any]
+) -> None:
+    """Report optional live training state without allowing UI observers to stop training."""
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(payload)
+    except Exception:  # pragma: no cover - observer failure must not affect model artefacts.
+        LOGGER.exception("Training progress observer failed")
 
 
 def _detectors(
@@ -56,7 +68,6 @@ def _detectors(
         "one_class_svm": OneClassSVM(
             nu=float(models["one_class_svm"]["nu"]), gamma=models["one_class_svm"]["gamma"]
         ),
-        "pca_autoencoder": PCAAutoencoder(float(models["pca_autoencoder"]["explained_variance"])),
         "lstm_autoencoder": LSTMAutoencoder(
             **{
                 **lstm_settings,
@@ -71,7 +82,7 @@ def _detectors(
 def _anomaly_scores(model_name: str, model: Any, values: np.ndarray) -> np.ndarray:
     """Normalize every detector so larger scores always mean more anomalous."""
     raw = model.score_samples(values)
-    return raw if model_name in {"pca_autoencoder", "lstm_autoencoder"} else -raw
+    return raw if model_name == "lstm_autoencoder" else -raw
 
 
 def _binary_labels(labels: pd.Series | None) -> np.ndarray | None:
@@ -150,18 +161,12 @@ def _importance(
 ) -> pd.DataFrame:
     """Estimate model-specific feature contribution on an evaluation sample.
 
-    Tree and PCA models expose learned structure directly. For other detectors,
-    including LSTM AE, score-shift permutation estimates how much each feature
-    affects the detector's anomaly assessment without needing labels.
+    Tree models expose learned structure directly. For LSTM AE and the other
+    remaining detectors, score-shift permutation estimates how much each
+    feature affects the anomaly assessment without needing labels.
     """
     rows: list[dict[str, float | int | str]] = []
-    if model_name == "pca_autoencoder":
-        weighted = (
-            np.square(model.model.components_) * model.model.explained_variance_ratio_[:, None]
-        )
-        values_by_feature = np.sqrt(weighted.sum(axis=0))
-        method = "pca_weighted_loading"
-    elif model_name == "isolation_forest":
+    if model_name == "isolation_forest":
         trees = [tree.feature_importances_ for tree in model.estimators_]
         values_by_feature = np.mean(trees, axis=0)
         method = "isolation_tree_split_gain"
@@ -230,6 +235,7 @@ def train_models(
     labels_path: Path | None = None,
     candidates: list[str] | None = None,
     model_overrides: dict[str, dict[str, Any]] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Prepare selected data and compare detectors for each requested deployment scope."""
     if strategy not in {"per_protocol", "grouped"}:
@@ -258,6 +264,10 @@ def train_models(
             "Training anomaly detector candidates", total=len(scopes) * len(candidate_names)
         )
         for scope_name, protocols in scopes.items():
+            _emit_progress(
+                progress_callback,
+                {"event": "scope_started", "scope": scope_name, "protocols": protocols},
+            )
             scope_dir = output_dir / scope_name
             prepared_path = scope_dir / "prepared.parquet"
             scope_source = source[source["protocol"].isin(protocols)].reset_index(drop=True)
@@ -287,6 +297,16 @@ def train_models(
                 )
                 progress.advance(task, len(candidate_names))
                 continue
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "scope_prepared",
+                    "scope": scope_name,
+                    "protocols": protocols,
+                    "rows": len(prepared),
+                    "input_features": len(input_columns),
+                },
+            )
             values = prepared[input_columns].to_numpy(dtype=float)
             labels = prepared["label"] if "label" in prepared.columns else None
             normal_mask = _normal_training_mask(
@@ -300,13 +320,51 @@ def train_models(
             test_labels = _binary_labels(labels.iloc[test_idx] if labels is not None else None)
             for model_name in candidate_names:
                 model = _detectors(config, model_overrides)[model_name]
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "event": "model_started",
+                        "scope": scope_name,
+                        "protocols": protocols,
+                        "model": model_name,
+                        "training_rows": len(fit_values),
+                        "test_rows": len(test_idx),
+                        "input_features": len(input_columns),
+                    },
+                )
                 if model_name == "local_outlier_factor":
                     model.n_neighbors = min(model.n_neighbors, max(2, len(fit_values) - 1))
                 memory_before_mb = psutil.Process().memory_info().rss / 1024**2
                 started_at = time.perf_counter()
-                model.fit(fit_values)
+                if model_name == "lstm_autoencoder":
+                    model.fit(
+                        fit_values,
+                        progress_callback=lambda update, scope_name=scope_name, protocols=protocols, model_name=model_name: (
+                            _emit_progress(
+                                progress_callback,
+                                {
+                                    **update,
+                                    "scope": scope_name,
+                                    "protocols": protocols,
+                                    "model": model_name,
+                                },
+                            )
+                        ),
+                    )
+                else:
+                    model.fit(fit_values)
                 fit_seconds = time.perf_counter() - started_at
                 memory_after_mb = psutil.Process().memory_info().rss / 1024**2
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "event": "model_scoring",
+                        "scope": scope_name,
+                        "protocols": protocols,
+                        "model": model_name,
+                        "fit_seconds": fit_seconds,
+                    },
+                )
                 train_scores = _anomaly_scores(model_name, model, fit_values)
                 threshold = float(
                     np.quantile(train_scores, 1 - float(config["models"]["contamination"]))
@@ -347,7 +405,7 @@ def train_models(
                     model_metadata["model_artifact"] = str(model_dir / "model.joblib")
                 write_table(score_frame, model_dir / "scores.parquet")
                 metrics = _metrics(scores, test_labels, threshold)
-                if model_name in {"pca_autoencoder", "lstm_autoencoder"}:
+                if model_name == "lstm_autoencoder":
                     reconstruction_mse = float(np.mean(scores))
                     metrics["reconstruction_mse_mean"] = round(reconstruction_mse, 8)
                     metrics["reconstruction_rmse"] = round(float(np.sqrt(reconstruction_mse)), 8)
@@ -375,6 +433,17 @@ def train_models(
                 importance_rows.append(importance)
                 write_json(metrics, model_dir / "metrics.json")
                 write_json(model_metadata, model_dir / "model.json")
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "event": "model_completed",
+                        "scope": scope_name,
+                        "protocols": protocols,
+                        "model": model_name,
+                        "fit_seconds": fit_seconds,
+                        "threshold": threshold,
+                    },
+                )
                 report_rows.append(
                     {
                         "scope": scope_name,
@@ -441,6 +510,7 @@ def run_feature_experiments(
     labels_path: Path | None = None,
     candidates: list[str] | None = None,
     model_overrides: dict[str, dict[str, Any]] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Run an all-feature baseline and any number of selected feature profiles.
 
@@ -462,6 +532,13 @@ def run_feature_experiments(
         profile_id = _safe_profile_id(profile)
         target = output_dir / profile_id
         try:
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "profile_started",
+                    "feature_profile": "all_features" if profile is None else str(profile),
+                },
+            )
             comparison, summary = train_models(
                 feature_path=feature_path,
                 config=config,
@@ -472,6 +549,7 @@ def run_feature_experiments(
                 labels_path=labels_path,
                 candidates=candidates,
                 model_overrides=model_overrides,
+                progress_callback=progress_callback,
             )
             comparison = comparison.copy()
             comparison.insert(
@@ -487,6 +565,14 @@ def run_feature_experiments(
                     "experiment": summary,
                 }
             )
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "profile_completed",
+                    "feature_profile": "all_features" if profile is None else str(profile),
+                    "model_runs": len(comparison),
+                },
+            )
         except Exception as error:  # Keep other selected profiles inspectable after one failure.
             LOGGER.exception("Feature experiment failed for profile '%s'", profile_id)
             run_summaries.append(
@@ -495,6 +581,14 @@ def run_feature_experiments(
                     "status": "failed",
                     "error": str(error),
                 }
+            )
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "profile_failed",
+                    "feature_profile": "all_features" if profile is None else str(profile),
+                    "error": str(error),
+                },
             )
     aggregate = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
     comparison_path = output_dir / "comparison.parquet"
@@ -522,6 +616,7 @@ def run_lstm_sweep(
     parameter_sets: list[dict[str, Any]],
     output_dir: Path,
     labels_path: Path | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Run labelled LSTM parameter variants across the baseline and selected profiles."""
     if not parameter_sets:
@@ -540,6 +635,15 @@ def run_lstm_sweep(
             profile_id = _safe_profile_id(profile)
             target = output_dir / variant_id / profile_id
             try:
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "event": "sweep_variant_started",
+                        "variant": variant_id,
+                        "feature_profile": "all_features" if profile is None else str(profile),
+                        "parameters": parameters,
+                    },
+                )
                 comparison, summary = train_models(
                     feature_path=feature_path,
                     config=config,
@@ -550,6 +654,7 @@ def run_lstm_sweep(
                     labels_path=labels_path,
                     candidates=["lstm_autoencoder"],
                     model_overrides={"lstm_autoencoder": parameters},
+                    progress_callback=progress_callback,
                 )
                 comparison = comparison.copy()
                 comparison.insert(
@@ -569,6 +674,14 @@ def run_lstm_sweep(
                         "experiment": summary,
                     }
                 )
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "event": "sweep_variant_completed",
+                        "variant": variant_id,
+                        "feature_profile": "all_features" if profile is None else str(profile),
+                    },
+                )
             except (
                 Exception
             ) as error:  # Preserve successful variants for comparison after one failure.
@@ -581,6 +694,15 @@ def run_lstm_sweep(
                         "status": "failed",
                         "error": str(error),
                     }
+                )
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "event": "sweep_variant_failed",
+                        "variant": variant_id,
+                        "feature_profile": "all_features" if profile is None else str(profile),
+                        "error": str(error),
+                    },
                 )
     aggregate = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
     comparison_path = output_dir / "sweep-comparison.parquet"

@@ -5,13 +5,12 @@ The Phase 1 training command compares five unsupervised anomaly detectors:
 - Isolation Forest
 - Local Outlier Factor in novelty mode
 - One-Class SVM
-- PCA reconstruction autoencoder
 - Sequence LSTM autoencoder (LSTM AE)
 
 ```powershell
 uv run anomaly train artifacts/features/capture.parquet --profile compact-it --strategy grouped --group it
 uv run anomaly train artifacts/features/capture.parquet --strategy per_protocol --labels artifacts/mapping/it.csv
-uv run anomaly train artifacts/features/capture.parquet --strategy per_protocol --models isolation_forest,pca_autoencoder,lstm_autoencoder
+uv run anomaly train artifacts/features/capture.parquet --strategy per_protocol --models isolation_forest,lstm_autoencoder
 ```
 
 Every model gets the same prepared input, a score where higher means more anomalous, a contamination-derived threshold, persisted model artefact, scores, metrics, feature contribution, and a comparison row. The preprocessing transformer is fit on the training partition only before transforming evaluation data. The default temporal split keeps later traffic outside training; set `models.split_strategy: random` only for a deliberate i.i.d. study. When trustworthy mapped labels contain both normal and anomalous data, ROC-AUC and average precision are reported; otherwise the command reports operational score distributions only.

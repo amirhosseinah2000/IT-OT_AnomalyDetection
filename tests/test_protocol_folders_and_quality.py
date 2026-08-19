@@ -60,6 +60,7 @@ def test_protocol_folder_extracts_all_direct_pcaps(tmp_path) -> None:
     assert manifest["protocol_counts"] == {"modbus": 2}
     assert features["capture"].nunique() == 2
     assert features["flow_id"].nunique() == 2
+    assert manifest["flow_count"] == 2
     assert features["modbus_transaction_id"].tolist() == [1, 2]
 
 

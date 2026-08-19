@@ -79,7 +79,9 @@ models:
   # `temporal` keeps later traffic out of the fit partition, which is required
   # for sequence-aware LSTM validation. Use `random` only for i.i.d. studies.
   split_strategy: temporal
-  candidates: [isolation_forest, local_outlier_factor, one_class_svm, pca_autoencoder, lstm_autoencoder]
+  # PCA reconstruction is deliberately excluded: it is not suitable for this
+  # sequence-oriented Modbus use case. Historical PCA artefacts remain readable.
+  candidates: [isolation_forest, local_outlier_factor, one_class_svm, lstm_autoencoder]
   isolation_forest:
     n_estimators: 300
     max_samples: auto
@@ -88,29 +90,29 @@ models:
   one_class_svm:
     nu: 0.05
     gamma: scale
-  pca_autoencoder:
-    explained_variance: 0.95
   lstm_autoencoder:
-    # Windows preserve packet/flow order within a protocol or deployment group.
-    sequence_length: 16
-    sequence_stride: 16
-    hidden_size: 32
-    latent_size: 16
-    num_layers: 1
-    dropout: 0.0
+    # Reference-aligned Modbus LSTM-AE defaults. Windows preserve packet/flow
+    # order within a protocol; the validation split is chronological.
+    sequence_length: 10
+    sequence_stride: 10
+    hidden_size: 128
+    latent_size: 64
+    num_layers: 2
+    dropout: 0.2
     learning_rate: 0.001
     batch_size: 256
-    epochs: 20
+    epochs: 100
     validation_fraction: 0.15
-    patience: 5
+    patience: 15
     # Caps fit cost while score generation still covers every held-out record.
     max_train_windows: 5000
     device: cpu
 
 feature_evaluation:
-  # Runs independently of CSV mapping and never consumes CSV labels.
-  enabled: true
-  detectors: [isolation_forest, pca_autoencoder, lstm_autoencoder]
+  # Keep PCAP ingestion lightweight. Start model runs explicitly in the
+  # dashboard/CLI after reviewing feature extraction and label mapping.
+  enabled: false
+  detectors: [isolation_forest, lstm_autoencoder]
   strategy: grouped
   group: all
   # `all_features` is always included. Add dashboard/CLI profile names here to

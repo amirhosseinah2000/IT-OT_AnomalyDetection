@@ -56,12 +56,12 @@ Run `uv run anomaly --config config/lab-64gb.yaml pipeline run`. The batch run e
 
 ## Unsupervised feature evaluation
 
-Feature evaluation is independent of mapping. The default configuration trains Isolation Forest, PCA reconstruction autoencoder, and sequence LSTM autoencoder over all extracted features. Add as many subset profile names as needed to `feature_evaluation.selected_profiles`:
+Feature evaluation is independent of mapping and is disabled by default so ingestion does not begin model training. Enable it only for a controlled run. New candidates exclude PCA reconstruction because this project uses a sequence-oriented Modbus workflow; use the LSTM autoencoder for reconstruction experiments. Add as many subset profile names as needed to `feature_evaluation.selected_profiles`:
 
 ```yaml
 feature_evaluation:
   enabled: true
-  detectors: [isolation_forest, pca_autoencoder, lstm_autoencoder]
+  detectors: [isolation_forest, lstm_autoencoder]
   strategy: grouped
   group: all
   selected_profiles: [compact-it, operations-only]
@@ -77,11 +77,11 @@ The following `pipeline run` compares `all_features` against every selected prof
 models:
   split_strategy: temporal
   lstm_autoencoder:
-    sequence_length: 16
-    sequence_stride: 16
-    hidden_size: 32
-    latent_size: 16
-    epochs: 20
+    sequence_length: 10
+    sequence_stride: 10
+    hidden_size: 128
+    latent_size: 64
+    epochs: 100
     max_train_windows: 5000
     device: cpu
 ```

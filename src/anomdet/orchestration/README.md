@@ -14,6 +14,6 @@ For every discovered protocol folder (or configured `data.protocol_folders` item
 4. combines all extracted feature rows; and
 5. writes `run-summary.json` with every output and failure.
 
-It also runs the two detectors in `feature_evaluation.detectors` without using any CSV labels. First, they train on all available catalogue features. After a user creates a profile in the dashboard or with `anomaly select create`, add its name to `feature_evaluation.selected_profiles` and rerun the batch. The same two detectors then run on the selected subset, producing a direct all-features-versus-selected comparison for feature count, training time, memory delta, score distributions, and feature importance.
+Automatic feature evaluation is disabled by default so a PCAP ingestion run remains an extraction, mapping, and evidence-generation operation. Enable it deliberately only for a controlled experiment, or use the dashboard/CLI after reviewing feature quality. New training candidates exclude PCA; use the LSTM autoencoder for sequence-oriented Modbus experiments.
 
 Outputs are placed in `artifacts/runs/batch-<timestamp>/`. Mapping candidates remain separate deliberately. Review their `match_status` and `match_confidence` before deciding which label source is fit for training.

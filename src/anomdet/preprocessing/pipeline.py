@@ -133,10 +133,18 @@ def prepare_features(
     if source.empty:
         raise ValueError("Cannot prepare an empty feature table.")
     profile_data = load_profile(profile, config) if profile else None
-    requested = profile_data["features"] if profile_data else sorted(feature_names())
     if protocols:
         source = source[source["protocol"].isin(protocols)].copy()
     source = source.reset_index(drop=True)
+    observed_protocols = tuple(
+        sorted(source["protocol"].dropna().astype("string").str.lower().unique().tolist())
+        if "protocol" in source.columns
+        else []
+    )
+    applicable = feature_names(observed_protocols or None)
+    requested = profile_data["features"] if profile_data else sorted(applicable)
+    ignored_inapplicable = sorted(set(requested).difference(applicable))
+    requested = [feature for feature in requested if feature in applicable]
     selected = [column for column in requested if column in source.columns]
     if "protocol" in source.columns and "protocol" not in selected:
         selected.append("protocol")
@@ -192,6 +200,7 @@ def prepare_features(
         "source_rows": len(source),
         "prepared_rows": len(prepared),
         "selected_input_features": retained,
+        "inapplicable_profile_features": ignored_inapplicable,
         "dropped_missing_features": dropped,
         "dropped_constant_features": constant_features,
         "numeric_input_features": numeric_columns,

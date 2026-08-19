@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime
 from itertools import product
 from pathlib import Path
@@ -11,12 +12,13 @@ from typing import Any
 import altair as alt
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import streamlit as st
 
 from anomdet.core.config import load_config
 from anomdet.core.io import read_table
 from anomdet.core.resources import snapshot
-from anomdet.features.catalog import available_features
+from anomdet.features.catalog import available_features, feature_names
 from anomdet.modelling.training import run_feature_experiments, run_lstm_sweep
 from anomdet.orchestration.batch import run_inventory
 from anomdet.selection.profiles import create_profile
@@ -31,13 +33,13 @@ st.set_page_config(
 ALL_PROTOCOLS = ["ssh", "dns", "http", "modbus", "s7comm"]
 MODEL_OPTIONS = [
     "isolation_forest",
-    "pca_autoencoder",
     "lstm_autoencoder",
     "local_outlier_factor",
     "one_class_svm",
 ]
 METADATA_COLUMNS = {"row_id", "label", "protocol", "flow_id", "capture", "timestamp"}
 CHART_SAMPLE_SIZE = 12_000
+DASHBOARD_SOURCE_SAMPLE_SIZE = 60_000
 
 
 @st.cache_data(max_entries=24, show_spinner="Loading local artefact...")
@@ -60,6 +62,50 @@ def _read(path: Path) -> pd.DataFrame:
     return _load_table(str(path), path.stat().st_mtime_ns)
 
 
+@st.cache_data(max_entries=12, show_spinner="Loading a protocol-safe dashboard sample...")
+def _load_dashboard_table(
+    path_text: str, modified_ns: int, maximum_rows: int = DASHBOARD_SOURCE_SAMPLE_SIZE
+) -> pd.DataFrame:
+    """Load a bounded, time-spread sample without reading a multi-GB protocol table at once."""
+    del modified_ns
+    path = Path(path_text)
+    if path.suffix.lower() not in {".parquet", ".pq"}:
+        frame = read_table(path)
+        frame.attrs["source_rows"] = len(frame)
+        frame.attrs["sampled_for_dashboard"] = False
+        return frame
+
+    parquet = pq.ParquetFile(path)
+    source_rows = parquet.metadata.num_rows
+    if source_rows <= maximum_rows:
+        frame = read_table(path)
+        frame.attrs["source_rows"] = source_rows
+        frame.attrs["sampled_for_dashboard"] = False
+        return frame
+
+    group_count = parquet.num_row_groups
+    selected_groups = np.unique(
+        np.linspace(0, group_count - 1, num=min(group_count, 16), dtype=int)
+    )
+    rows_per_group = max(1, maximum_rows // len(selected_groups))
+    pieces: list[pd.DataFrame] = []
+    for group in selected_groups:
+        piece = parquet.read_row_group(int(group)).to_pandas()
+        if len(piece) > rows_per_group:
+            positions = np.linspace(0, len(piece) - 1, num=rows_per_group, dtype=int)
+            piece = piece.iloc[positions]
+        pieces.append(piece)
+    frame = pd.concat(pieces, ignore_index=True, sort=False)
+    frame.attrs["source_rows"] = source_rows
+    frame.attrs["sampled_for_dashboard"] = True
+    return frame
+
+
+def _read_dashboard(path: Path) -> pd.DataFrame:
+    """Read one protocol's artefact at a size safe for an interactive browser session."""
+    return _load_dashboard_table(str(path), path.stat().st_mtime_ns)
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     """Load a JSON manifest while including its modification time in the cache key."""
     return _load_json(str(path), path.stat().st_mtime_ns)
@@ -72,17 +118,59 @@ def _find_files(root: Path, pattern: str) -> list[Path]:
     return sorted(root.rglob(pattern), key=lambda item: item.stat().st_mtime_ns, reverse=True)
 
 
+def _feature_files(run: Path) -> list[Path]:
+    """Return direct extraction tables, excluding combined and downstream model artefacts."""
+    directory = run / "features"
+    if not directory.exists():
+        return []
+    return sorted(
+        (path for path in directory.glob("*.parquet") if path.name != "all-datasets.parquet"),
+        key=lambda path: path.name.casefold(),
+    )
+
+
+def _manifest_for_feature(feature_path: Path) -> dict[str, Any]:
+    """Return the extraction manifest next to a protocol table when it is valid JSON."""
+    manifest_path = feature_path.with_suffix(".manifest.json")
+    if not manifest_path.exists():
+        return {}
+    try:
+        return _read_json(manifest_path)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _protocol_feature_sources(run: Path) -> dict[str, Path]:
+    """Map each protocol to its own extracted table before considering a combined table."""
+    sources: dict[str, Path] = {}
+    for feature_path in _feature_files(run):
+        manifest = _manifest_for_feature(feature_path)
+        protocol = str(manifest.get("expected_protocol", "")).strip().lower()
+        if not protocol:
+            protocol = feature_path.stem.split("-", maxsplit=1)[0].lower()
+        if protocol in ALL_PROTOCOLS:
+            sources[protocol] = feature_path
+    if sources:
+        return {protocol: sources[protocol] for protocol in ALL_PROTOCOLS if protocol in sources}
+    combined = run / "features" / "all-datasets.parquet"
+    return {"combined": combined} if combined.exists() else {}
+
+
 def _discover_runs(artifact_root: Path) -> list[Path]:
-    """Discover self-contained pipeline runs from their combined feature output."""
+    """Discover runs from protocol extraction tables, including runs without a combined table."""
     if not artifact_root.exists():
         return []
     runs: set[Path] = set()
-    direct = artifact_root / "features" / "all-datasets.parquet"
-    if direct.exists():
+    if (
+        _feature_files(artifact_root)
+        or (artifact_root / "features" / "all-datasets.parquet").exists()
+    ):
         runs.add(artifact_root)
-    for combined in artifact_root.rglob("all-datasets.parquet"):
-        if combined.parent.name == "features":
-            runs.add(combined.parent.parent)
+    for feature_dir in artifact_root.rglob("features"):
+        if feature_dir.is_dir() and (
+            any(feature_dir.glob("*.parquet")) or (feature_dir / "all-datasets.parquet").exists()
+        ):
+            runs.add(feature_dir.parent)
     return sorted(
         runs,
         key=lambda item: (
@@ -102,6 +190,64 @@ def _run_label(run: Path, artifact_root: Path) -> str:
         return str(run)
 
 
+def _as_nonnegative_int(value: Any) -> int | None:
+    """Return a manifest count only when it is a usable non-negative integer."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _source_summary(feature_path: Path) -> dict[str, int | None]:
+    """Read cheap, persisted source quantities without loading a Parquet table."""
+    manifest = _manifest_for_feature(feature_path)
+    captures = manifest.get("captures", []) if isinstance(manifest, dict) else []
+    capture_count = _as_nonnegative_int(manifest.get("capture_count"))
+    if capture_count is None:
+        capture_count = len(captures) if isinstance(captures, list) else None
+    return {
+        "records": _as_nonnegative_int(manifest.get("rows")),
+        "flows": _as_nonnegative_int(manifest.get("flow_count")),
+        "captures": capture_count,
+    }
+
+
+def _compact_count(value: int | None) -> str:
+    """Format a manifest quantity for compact sidebar context."""
+    if value is None:
+        return "unknown"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return f"{value:,}"
+
+
+def _source_picker_label(protocol: str, feature_path: Path) -> str:
+    """Make selected protocol sources auditable directly in the sidebar."""
+    summary = _source_summary(feature_path)
+    capture_text = (
+        f"{summary['captures']} PCAP" if summary["captures"] is not None else "legacy manifest"
+    )
+    return f"{protocol.upper()} · {capture_text} · {_compact_count(summary['records'])} records"
+
+
+def _run_picker_label(run: Path, artifact_root: Path, is_latest: bool) -> str:
+    """Expose a run's data volume so a stale run cannot look like the latest one."""
+    sources = _protocol_feature_sources(run)
+    summaries = [_source_summary(path) for path in sources.values()]
+    record_counts = [summary["records"] for summary in summaries]
+    capture_counts = [summary["captures"] for summary in summaries]
+    records = sum(count for count in record_counts if count is not None)
+    captures = sum(count for count in capture_counts if count is not None)
+    latest = " (latest)" if is_latest else ""
+    return (
+        f"{_run_label(run, artifact_root)}{latest} · {len(sources)} protocol(s) · "
+        f"{captures} PCAP · {_compact_count(records)} records"
+    )
+
+
 def _feature_path(run: Path | None) -> Path | None:
     """Return the single combined feature source for a selected pipeline run."""
     if run is None:
@@ -110,11 +256,54 @@ def _feature_path(run: Path | None) -> Path | None:
     return candidate if candidate.exists() else None
 
 
-def _safe_numeric(frame: pd.DataFrame) -> list[str]:
-    """Return analysable numerical columns without technical record identifiers."""
+def _protocol_feature_names(protocol: str) -> set[str]:
+    """Return only common and protocol-specific catalogue features for one protocol."""
+    return feature_names((protocol.lower(),))
+
+
+def _visible_feature_names(frame: pd.DataFrame, protocol: str | None = None) -> set[str]:
+    """Choose catalogue features valid for one protocol or the shared multi-protocol view."""
+    if protocol:
+        return _protocol_feature_names(protocol)
+    present_protocols = _protocols(frame)
+    if len(present_protocols) == 1:
+        return _protocol_feature_names(present_protocols[0])
+    if len(present_protocols) > 1:
+        candidates = [_protocol_feature_names(item) for item in present_protocols]
+        return set.intersection(*candidates)
+    return set()
+
+
+def _safe_numeric(frame: pd.DataFrame, protocol: str | None = None) -> list[str]:
+    """Return only numerical features applicable to the current protocol scope."""
     excluded = METADATA_COLUMNS | {"src_port", "dst_port"}
+    applicable = _visible_feature_names(frame, protocol)
     return [
-        column for column in frame.select_dtypes(include="number").columns if column not in excluded
+        column
+        for column in frame.select_dtypes(include="number").columns
+        if column in applicable and column not in excluded
+    ]
+
+
+def _protocol_display_columns(frame: pd.DataFrame, protocol: str) -> list[str]:
+    """Keep raw-record views free of blank schema fields from other protocols."""
+    trace_columns = [
+        "capture",
+        "timestamp",
+        "protocol",
+        "flow_id",
+        "src_ip",
+        "src_port",
+        "dst_ip",
+        "dst_port",
+        "transport",
+        "label",
+    ]
+    applicable = _protocol_feature_names(protocol)
+    return [
+        column
+        for column in [*trace_columns, *frame.columns]
+        if column in frame.columns and (column in trace_columns or column in applicable)
     ]
 
 
@@ -165,6 +354,55 @@ def _protocols(frame: pd.DataFrame) -> list[str]:
     return [protocol for protocol in ALL_PROTOCOLS if protocol in present]
 
 
+def _render_capture_inventory(feature_path: Path, protocol: str) -> None:
+    """Make PCAP inclusion explicit so an operator can verify newly added captures."""
+    manifest = _manifest_for_feature(feature_path)
+    captures = manifest.get("captures", []) if isinstance(manifest, dict) else []
+    source_rows = manifest.get("rows") if isinstance(manifest, dict) else None
+    source_flows = manifest.get("flow_count") if isinstance(manifest, dict) else None
+    if not isinstance(captures, list):
+        captures = []
+    capture_count = (
+        manifest.get("capture_count", len(captures)) if isinstance(manifest, dict) else 0
+    )
+    row_text = (
+        f"{int(source_rows):,} extracted records"
+        if isinstance(source_rows, int)
+        else "row count unavailable"
+    )
+    flow_text = f" · {int(source_flows):,} distinct flows" if isinstance(source_flows, int) else ""
+    st.caption(
+        f"Active source: `{feature_path}` · {protocol.upper()} · "
+        f"{capture_count} PCAP file(s) · {row_text}{flow_text}."
+    )
+    if not captures:
+        return
+    rows: list[dict[str, Any]] = []
+    for capture in captures:
+        if not isinstance(capture, dict):
+            continue
+        rows.append(
+            {
+                "capture": Path(str(capture.get("capture", ""))).name,
+                "packets_read": capture.get("packets_read"),
+                "retained_protocol_rows": capture.get("retained_rows"),
+                "supported_protocol_counts": json.dumps(
+                    capture.get("supported_protocol_counts", {}), ensure_ascii=False
+                ),
+                "filtered_protocol_counts": json.dumps(
+                    capture.get("filtered_protocol_counts", {}), ensure_ascii=False
+                ),
+            }
+        )
+    if rows:
+        with st.expander("PCAP inclusion audit", icon=":material/folder_open:"):
+            st.caption(
+                "Every row below is one physical PCAP that was read for the selected protocol. "
+                "Filtered counts show packets from another supported protocol that were excluded."
+            )
+            st.dataframe(pd.DataFrame(rows), hide_index=True, height=360)
+
+
 def _metric_row(frame: pd.DataFrame) -> None:
     """Render a compact operational snapshot for the selected run or protocol."""
     timestamps = (
@@ -173,9 +411,18 @@ def _metric_row(frame: pd.DataFrame) -> None:
         else pd.Series(dtype="datetime64[ns, UTC]")
     )
     flows = int(frame["flow_id"].nunique()) if "flow_id" in frame.columns else 0
+    source_rows = int(frame.attrs.get("source_rows", len(frame)))
+    sampled = bool(frame.attrs.get("sampled_for_dashboard", False))
     with st.container(horizontal=True):
-        st.metric("Records", f"{len(frame):,}", border=True)
-        st.metric("Flows", f"{flows:,}", border=True)
+        st.metric("Source records", f"{source_rows:,}", border=True)
+        st.metric(
+            "Displayed sample", f"{len(frame):,}" if sampled else "Complete table", border=True
+        )
+        st.metric(
+            "Flows in displayed sample" if sampled else "Distinct flows",
+            f"{flows:,}",
+            border=True,
+        )
         st.metric(
             "Protocols",
             f"{frame['protocol'].nunique() if 'protocol' in frame.columns else 0:,}",
@@ -300,9 +547,9 @@ def _distribution_chart(frame: pd.DataFrame, feature: str) -> None:
     st.altair_chart(chart)
 
 
-def _missingness_chart(frame: pd.DataFrame) -> None:
+def _missingness_chart(frame: pd.DataFrame, protocol: str | None = None) -> None:
     """Visualise the most incomplete numerical features in the current protocol scope."""
-    numerical = _safe_numeric(frame)
+    numerical = _safe_numeric(frame, protocol)
     if not numerical:
         st.info("No numeric features are present.", icon=":material/info:")
         return
@@ -433,7 +680,7 @@ def _feature_evidence(frame: pd.DataFrame, protocol: str) -> tuple[pd.DataFrame,
     This is a protocol-local observability score, not a claim of model causality.
     Model-specific contribution is presented separately from persisted importance artefacts.
     """
-    numerical = _safe_numeric(frame)
+    numerical = _safe_numeric(frame, protocol)
     if not numerical:
         return pd.DataFrame(), pd.DataFrame()
     sample = _sample(frame[numerical], 40_000)
@@ -1546,6 +1793,15 @@ def _render_model_inspection(
     if importance_path.exists():
         importance = _read(importance_path)
         if not importance.empty and "importance" in importance.columns:
+            importance = importance[
+                importance["feature"].isin(_protocol_feature_names(protocol))
+            ].copy()
+            if importance.empty:
+                st.info(
+                    "This detector has no persisted importance values for features applicable to "
+                    f"{protocol.upper()}.",
+                    icon=":material/info:",
+                )
             legacy_importance = "raw_importance" not in importance.columns
             raw_column = "raw_importance" if not legacy_importance else "importance"
             importance = importance.copy()
@@ -2192,7 +2448,7 @@ def _render_protocol_explorer(frame: pd.DataFrame, run: Path) -> None:
     elif section == "Feature value & guide":
         _render_feature_value(scoped, protocol)
         st.subheader("Protocol feature catalogue")
-        _feature_guide(protocol, set(scoped.columns))
+        _feature_guide(protocol, set(_protocol_display_columns(scoped, protocol)))
     else:
         evidence, _correlation = _feature_evidence(scoped, protocol)
         _render_model_inspection(frame, run, protocol, evidence)
@@ -2276,7 +2532,11 @@ def _render_protocol_explorer(frame: pd.DataFrame, run: Path) -> None:
         st.caption(
             "A deterministic sample is shown; the dashboard never changes your raw artefact."
         )
-        st.dataframe(_sample(scoped, 1000), hide_index=True, height=560)
+        st.dataframe(
+            _sample(scoped[_protocol_display_columns(scoped, protocol)], 1000),
+            hide_index=True,
+            height=560,
+        )
 
 
 def _render_results(frame: pd.DataFrame, run: Path) -> None:
@@ -2460,7 +2720,10 @@ def _render_profile_builder(
 
 
 def _render_experiment_runner(
-    artifact_root: Path, run: Path | None, frame: pd.DataFrame | None
+    artifact_root: Path,
+    run: Path | None,
+    frame: pd.DataFrame | None,
+    active_feature_path: Path | None,
 ) -> None:
     """Run baseline/profile comparisons and optional LSTM parameter sweeps from one form."""
     st.subheader("Train and compare")
@@ -2470,10 +2733,14 @@ def _render_experiment_runner(
             icon=":material/info:",
         )
         return
-    feature_path = _feature_path(run)
+    feature_path = active_feature_path or _feature_path(run)
     if feature_path is None:
-        st.error("The selected run has no combined feature table.", icon=":material/error:")
+        st.error("The selected run has no extracted feature table.", icon=":material/error:")
         return
+    st.caption(
+        "New experiments use the selected protocol's feature table. Select another protocol in "
+        "the sidebar to train and compare it separately."
+    )
     profiles = _profile_records(artifact_root)
     profile_labels = {item["label"]: item["path"] for item in profiles}
     label_sources: dict[str, Path | None] = {"No mapped labels (unsupervised)": None}
@@ -2489,7 +2756,7 @@ def _render_experiment_runner(
         models = st.multiselect(
             "Detectors",
             MODEL_OPTIONS,
-            default=["isolation_forest", "pca_autoencoder", "lstm_autoencoder"],
+            default=["isolation_forest", "lstm_autoencoder"],
         )
         selected_profiles = st.multiselect(
             "Selected feature profiles",
@@ -2508,16 +2775,16 @@ def _render_experiment_runner(
         left, middle, right = st.columns(3)
         with left:
             hidden_size = st.number_input(
-                "Hidden size", min_value=4, max_value=512, value=32, step=4
+                "Hidden size", min_value=4, max_value=512, value=128, step=8
             )
             latent_size = st.number_input(
-                "Latent size", min_value=2, max_value=256, value=16, step=2
+                "Latent size", min_value=2, max_value=256, value=64, step=4
             )
         with middle:
             sequence_length = st.number_input(
-                "Sequence length", min_value=2, max_value=256, value=16, step=2
+                "Sequence length", min_value=2, max_value=256, value=10, step=2
             )
-            epochs = st.number_input("Epochs", min_value=1, max_value=200, value=20, step=1)
+            epochs = st.number_input("Epochs", min_value=1, max_value=200, value=100, step=5)
         with right:
             batch_size = st.number_input(
                 "Batch size", min_value=8, max_value=4096, value=256, step=8
@@ -2551,8 +2818,12 @@ def _render_experiment_runner(
         "batch_size": int(batch_size),
         "max_train_windows": int(max_windows),
     }
+    training_events: list[dict[str, Any]] = []
+    training_started_at = time.perf_counter()
+    status: Any | None = None
     try:
-        with st.status("Training selected detectors", expanded=True) as status:
+        status = st.status("Training selected detectors", expanded=True)
+        with status:
             st.write("Baseline: all catalogue features")
             st.write(f"Selected profiles: {len(selected_paths)}")
             st.write(
@@ -2560,6 +2831,71 @@ def _render_experiment_runner(
                 if selected_labels
                 else "Evaluation labels: none"
             )
+            progress_bar = st.progress(0.0, text="Preparing model matrix")
+            metrics_slot = st.empty()
+            event_log_slot = st.empty()
+
+            def report_training_progress(event: dict[str, Any]) -> None:
+                """Render callback events from model training in the active Streamlit run."""
+                event_name = str(event.get("event", "update"))
+                elapsed_seconds = time.perf_counter() - training_started_at
+                record = {
+                    "elapsed_s": round(elapsed_seconds, 1),
+                    "event": event_name,
+                    "scope": event.get("scope"),
+                    "model": event.get("model"),
+                    "epoch": event.get("epoch"),
+                    "epochs": event.get("epochs"),
+                    "train_loss": event.get("train_loss"),
+                    "validation_loss": event.get("validation_loss"),
+                    "best_loss": event.get("best_loss"),
+                    "details": event.get("feature_profile") or event.get("variant"),
+                }
+                training_events.append(record)
+                if len(training_events) > 60:
+                    del training_events[:-60]
+                model_name = str(event.get("model", "detector")).replace("_", " ").title()
+                scope = str(event.get("scope", "selected scope"))
+                if event_name == "epoch":
+                    epoch = int(event["epoch"])
+                    total_epochs = max(int(event["epochs"]), 1)
+                    progress_bar.progress(
+                        epoch / total_epochs,
+                        text=f"{model_name} · {scope} · epoch {epoch}/{total_epochs}",
+                    )
+                    with metrics_slot.container():
+                        first, second, third, fourth = st.columns(4)
+                        first.metric("Epoch", f"{epoch}/{total_epochs}")
+                        second.metric("Train loss", f"{float(event['train_loss']):.6g}")
+                        validation_loss = event.get("validation_loss")
+                        third.metric(
+                            "Validation loss",
+                            f"{float(validation_loss):.6g}"
+                            if validation_loss is not None
+                            else "Not used",
+                        )
+                        fourth.metric("Best loss", f"{float(event['best_loss']):.6g}")
+                    status.update(
+                        label=f"Training {model_name}: epoch {epoch}/{total_epochs}",
+                        state="running",
+                        expanded=True,
+                    )
+                elif event_name == "model_started":
+                    progress_bar.progress(0.0, text=f"Starting {model_name} · {scope}")
+                    status.update(
+                        label=f"Starting {model_name} for {scope}", state="running", expanded=True
+                    )
+                elif event_name == "model_completed":
+                    progress_bar.progress(1.0, text=f"Completed {model_name} · {scope}")
+                    status.update(
+                        label=f"Completed {model_name} for {scope}", state="running", expanded=True
+                    )
+                elif event_name == "model_scoring":
+                    progress_bar.progress(1.0, text=f"Scoring and saving {model_name} · {scope}")
+                event_log_slot.dataframe(
+                    pd.DataFrame(training_events).tail(30), hide_index=True, height=280
+                )
+
             comparison, summary = run_feature_experiments(
                 feature_path=feature_path,
                 config=_config_for_dashboard("", artifact_root),
@@ -2570,6 +2906,7 @@ def _render_experiment_runner(
                 labels_path=selected_labels,
                 candidates=models,
                 model_overrides={"lstm_autoencoder": parameters},
+                progress_callback=report_training_progress,
             )
             st.write(f"Completed {len(comparison)} detector runs.")
             st.write(f"Comparison: `{summary['comparison']}`")
@@ -2601,6 +2938,7 @@ def _render_experiment_runner(
                     parameter_sets=variants,
                     output_dir=output_root / "lstm-sweep",
                     labels_path=selected_labels,
+                    progress_callback=report_training_progress,
                 )
                 st.write(f"Completed {len(sweep)} LSTM sweep runs: `{sweep_summary['comparison']}`")
             status.update(label="Experiment complete", state="complete", expanded=False)
@@ -2611,6 +2949,8 @@ def _render_experiment_runner(
             icon=":material/check_circle:",
         )
     except Exception as error:
+        if status is not None:
+            status.update(label="Experiment failed", state="error", expanded=True)
         st.error(f"Experiment did not complete: {error}", icon=":material/error:")
 
 
@@ -2646,7 +2986,10 @@ def _render_execution_history(run: Path | None) -> None:
 
 
 def _render_experiment_studio(
-    artifact_root: Path, run: Path | None, frame: pd.DataFrame | None
+    artifact_root: Path,
+    run: Path | None,
+    frame: pd.DataFrame | None,
+    active_feature_path: Path | None,
 ) -> None:
     """Group all write actions separately from the read-only analytics explorer."""
     area = st.segmented_control(
@@ -2662,7 +3005,7 @@ def _render_experiment_studio(
     elif area == "Feature profiles":
         _render_profile_builder(artifact_root, run, frame)
     elif area == "Train and compare":
-        _render_experiment_runner(artifact_root, run, frame)
+        _render_experiment_runner(artifact_root, run, frame, active_feature_path)
     else:
         _render_execution_history(run)
 
@@ -2688,12 +3031,36 @@ def main() -> None:
         artifact_root = Path(artifact_root_text)
         runs = _discover_runs(artifact_root)
         run: Path | None = None
+        active_feature_path: Path | None = None
+        active_protocol: str | None = None
         if runs:
-            labels = {_run_label(item, artifact_root): item for item in runs}
-            run = labels[st.selectbox("Pipeline run", list(labels), key="active_run")]
+            labels = {
+                _run_picker_label(item, artifact_root, item == runs[0]): item for item in runs
+            }
+            if st.session_state.get("active_run") not in labels:
+                st.session_state["active_run"] = next(iter(labels))
+            selected_label = st.selectbox("Pipeline run", list(labels), key="active_run")
+            run = labels[selected_label]
+            if run != runs[0]:
+                st.warning(
+                    f"An older run is selected. The newest available run is: "
+                    f"{_run_picker_label(runs[0], artifact_root, True)}",
+                    icon=":material/history:",
+                )
+            sources = _protocol_feature_sources(run)
+            if sources:
+                if st.session_state.get("active_protocol_source") not in sources:
+                    st.session_state["active_protocol_source"] = next(iter(sources))
+                active_protocol = st.selectbox(
+                    "Analysis protocol",
+                    list(sources),
+                    key="active_protocol_source",
+                    format_func=lambda protocol: _source_picker_label(protocol, sources[protocol]),
+                    help="Only this protocol's extracted table is loaded into the dashboard.",
+                )
+                active_feature_path = sources[active_protocol]
             st.caption(
-                "Results are scoped by protocol from the run's combined feature table, "
-                "never by individual feature-file names."
+                "Results are scoped by protocol and loaded from the matching protocol table."
             )
         else:
             st.caption("No completed pipeline run found. Create one in Experiment studio.")
@@ -2701,13 +3068,14 @@ def main() -> None:
             _load_table.clear()
             _load_json.clear()
             st.rerun()
-    feature_path = _feature_path(run)
     frame: pd.DataFrame | None = None
-    if feature_path is not None:
+    if active_feature_path is not None:
         try:
-            frame = _read(feature_path)
+            frame = _read_dashboard(active_feature_path)
         except Exception as error:
-            st.error(f"Could not load the combined feature table: {error}", icon=":material/error:")
+            st.error(
+                f"Could not load the selected protocol table: {error}", icon=":material/error:"
+            )
     workspace = st.segmented_control(
         "Workspace",
         ["Experiment studio", "Results explorer"],
@@ -2716,7 +3084,7 @@ def main() -> None:
         width="stretch",
     )
     if workspace == "Experiment studio":
-        _render_experiment_studio(artifact_root, run, frame)
+        _render_experiment_studio(artifact_root, run, frame, active_feature_path)
         return
     if run is None or frame is None:
         st.info(
@@ -2725,6 +3093,8 @@ def main() -> None:
             icon=":material/info:",
         )
         return
+    if active_feature_path is not None and active_protocol is not None:
+        _render_capture_inventory(active_feature_path, active_protocol)
     _render_results(frame, run)
 
 
