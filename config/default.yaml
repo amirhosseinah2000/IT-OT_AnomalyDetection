@@ -1,0 +1,179 @@
+# Central configuration for all Phase 1 commands. Copy it before changing defaults.
+project:
+  artifact_dir: artifacts
+  random_seed: 42
+  timezone: UTC
+
+data:
+  # Portable split-first layout. Every protocol has its own direct folder.
+  # data/raw/benign/pcap/<protocol>/...
+  # data/raw/attack/pcap/<protocol>/...
+  # data/raw/attack/labels/<protocol>/...
+  dataset_root: data/raw
+  benign_pcap_dir: benign/pcap
+  attack_pcap_dir: attack/pcap
+  attack_label_dir: attack/labels
+  # Legacy roots remain for the individual legacy commands only.
+  raw_pcap_dir: data/raw/pcap
+  it_label_dir: data/raw/labels/it
+  ot_label_dir: data/raw/labels/ot
+  interim_dir: data/interim
+  processed_dir: data/processed
+  # Preferred ingestion: create one folder per protocol below raw_pcap_dir
+  # (for example `pcap/modbus/`) and place any number of PCAP/PCAPNG files in it.
+  # With no configuration, `pipeline run` discovers supported protocol folders automatically.
+  # Use this list only to attach label files or override a folder/domain.
+  protocol_folders: []
+  # Optional explicit matches for files that deliberately have unrelated names.
+  # The automatic mapper still verifies endpoint and time evidence before using a label.
+  attack_pair_overrides: {}
+  # Legacy one-file-at-a-time inventory. Keep empty when using protocol folders.
+  # PCAP and label paths may be absolute or relative to their configured roots.
+  datasets: []
+  # Example:
+  # - protocol: modbus
+  #   folder: modbus
+  #   domain: ot
+  #   labels: [candidate-labels-1.csv, candidate-labels-2.csv]
+
+runtime:
+  execution_device: cpu
+  cpu_workers: 0              # 0 means use all logical CPUs minus one.
+  memory_limit_gb: 48         # Soft guardrail; keep below installed RAM.
+  batch_size: 50000
+  progress_refresh_seconds: 1
+
+capture:
+  supported_protocols: [ssh, dns, http, modbus, s7comm]
+  flow_idle_timeout_seconds: 60
+  behavior_window_seconds: 60
+  default_interface: null
+  tcpreplay:
+    enabled: false
+    binary: tcpreplay
+    interface: null
+    multiplier: 1.0
+
+mapping:
+  timestamp_tolerance_seconds: 5.0
+  minimum_match_rate: 0.90
+  minimum_match_confidence: 0.90
+  # The mapper evaluates these offsets from endpoint-matched evidence. This handles
+  # PCAP timestamps and CSV timestamps recorded in different timezones.
+  time_offset_candidates_hours: [-14, -12, -10, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 10, 12, 14]
+  timestamp_dayfirst: true
+  allow_reverse_flow_match: true
+  default_label: unknown
+  it:
+    label_columns: [Label, Attack Name, Category]
+    flow_id_columns: [Flow ID, FlowID]
+    timestamp_columns: [Timestamp, timestamp]
+    source_ip_columns: [Src IP, src_ip]
+    destination_ip_columns: [Dst IP, dst_ip]
+    source_port_columns: [Src Port, src_port]
+    destination_port_columns: [Dst Port, dst_port]
+  ot:
+    label_columns: [state, Label, label]
+    start_columns: [startDate, start, timestamp]
+    end_columns: [endDate, end]
+    source_ip_columns: [sIPs, sAddress, src_ip]
+    destination_ip_columns: [rIPs, rAddress, dst_ip]
+
+features:
+  missing_numeric_value: -1.0
+  high_cardinality_max_categories: 50
+  default_profile: all_features
+
+preprocessing:
+  numeric_scaler: robust
+  # Bound extreme scaled values so a malformed PCAP field cannot dominate LSTM-AE MSE.
+  numeric_clip: 12.0
+  categorical_encoder: onehot
+  min_non_null_ratio: 0.05
+
+models:
+  contamination: 0.05
+  # Dashboard/experiment default: deterministic distributed sample from a large protocol table.
+  # Set null only for an offline, full-table training run with adequate memory.
+  max_source_rows: 100000
+  train_split: 0.8
+  # `temporal` keeps later traffic out of the fit partition, which is required
+  # for sequence-aware LSTM validation. Use `random` only for i.i.d. studies.
+  split_strategy: temporal
+  # PCA reconstruction is deliberately excluded: it is not suitable for this
+  # sequence-oriented Modbus use case. Historical PCA artefacts remain readable.
+  candidates: [isolation_forest, local_outlier_factor, one_class_svm, lstm_autoencoder, mlp_autoencoder]
+  isolation_forest:
+    n_estimators: 300
+    max_samples: auto
+  local_outlier_factor:
+    n_neighbors: 35
+  one_class_svm:
+    nu: 0.05
+    gamma: scale
+  lstm_autoencoder:
+    # Reference-aligned Modbus LSTM-AE defaults. Windows preserve packet/flow
+    # order within a protocol; the validation split is chronological.
+    sequence_length: 10
+    sequence_stride: 10
+    hidden_size: 128
+    latent_size: 64
+    num_layers: 2
+    dropout: 0.2
+    learning_rate: 0.001
+    batch_size: 256
+    epochs: 100
+    validation_fraction: 0.15
+    patience: 15
+    # Caps fit cost while score generation still covers every held-out record.
+    max_train_windows: 5000
+    device: cpu
+    auto_architecture: true
+  mlp_autoencoder:
+    # Professional tabular autoencoder for non-sequence anomaly detection.
+    # Architecture auto-scales based on input features (hidden_sizes/latent_size = None).
+    hidden_sizes: null
+    latent_size: null
+    dropout: 0.1
+    learning_rate: 0.001
+    batch_size: 256
+    epochs: 50
+    validation_fraction: 0.15
+    patience: 10
+    max_train_samples: 10000
+    device: cpu
+    auto_architecture: true
+
+feature_evaluation:
+  # Keep PCAP ingestion lightweight. Start model runs explicitly in the
+  # dashboard/CLI after reviewing feature extraction and label mapping.
+  enabled: false
+  detectors: [isolation_forest, lstm_autoencoder, mlp_autoencoder]
+  strategy: grouped
+  group: all
+  # `all_features` is always included. Add dashboard/CLI profile names here to
+  # compare the same detectors using selected subsets, for example: [compact-it].
+  selected_profiles: []
+
+storage:
+  # Local Parquet/JSON files are always the portable source of truth. Enable the
+  # optional mirror only after configuring ClickHouse credentials in the environment.
+  clickhouse:
+    enabled: false
+    host: localhost
+    port: 8123
+    database: anomdet
+    username: default
+    password_env: CLICKHOUSE_PASSWORD
+    secure: false
+
+stage_one:
+  target_false_positive_rate: 0.01
+  validation_fraction: 0.20
+  ensemble_mode: either_detector
+
+stage_two:
+  test_fraction: 0.20
+  n_estimators: 300
+  min_samples_leaf: 2
+  include_stage_one_scores: true

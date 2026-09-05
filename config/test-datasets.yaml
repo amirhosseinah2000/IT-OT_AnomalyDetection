@@ -1,0 +1,10 @@
+# Ready-to-run override for the protocol-first files currently in this repository.
+# `anomaly dataset run` discovers every direct PCAP and CSV below these roots.
+data:
+  dataset_root: data/raw
+  benign_pcap_dir: benign/pcap
+  attack_pcap_dir: attack/pcap
+  attack_label_dir: attack/labels
+  # Add only genuinely unrelated names here. The selected CSV is still
+  # accepted only after endpoint/time evidence passes the mapping thresholds.
+  attack_pair_overrides: {}
