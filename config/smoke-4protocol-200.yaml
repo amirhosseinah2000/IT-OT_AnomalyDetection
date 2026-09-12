@@ -1,0 +1,45 @@
+# Fast, reproducible end-to-end validation: one normal and one attack PCAP
+# per protocol, with --max-packets 200.  This is intentionally not a model
+# quality experiment and never changes the complete folder-first configuration.
+data:
+  capture_allowlist:
+    benign:
+      dns: [dns3.pcapng]
+      http: [http3.pcapng]
+      modbus: [Nmodbus01.pcap]
+      s7comm: [s701.pcap]
+    attack:
+      dns: [BrowserHijacking_DNS.pcap]
+      http: [Recon-PingSweep_HTTP.pcap]
+      modbus: [Schneider_smurf_fast_0710_mb.pcap]
+      s7comm: [aS700.pcap]
+  attack_pair_overrides:
+    dns:
+      BrowserHijacking_DNS.pcap: BrowserHijacking_1.csv
+    http:
+      Recon-PingSweep_HTTP.pcap: Recon-PingSweep.pcap_Flow.csv
+    modbus:
+      Schneider_smurf_fast_0710_mb.pcap: Schneider_smurf_fast_0710.csv
+    s7comm:
+      aS700.pcap: Siemens_tcpall0_0709.csv
+
+# Keep the smoke run fast while preserving every artifact family.  The default
+# configuration remains the only choice for a quality evaluation or deployment
+# model; these values only validate the end-to-end output wiring.
+models:
+  isolation_forest:
+    n_estimators: 50
+  lstm_autoencoder:
+    epochs: 10
+    patience: 3
+stage_two:
+  n_estimators: 50
+evaluation:
+  threshold_points: 11
+  latency_sample_records: 200
+  stage2_diagnostic_estimators: 10
+  seed_stability_estimators: 10
+  diagnostic_cpu_workers: 2
+  permutation_repeats: 1
+  stage1_learning_curve_epochs: 3
+  seed_stability_seeds: [17]

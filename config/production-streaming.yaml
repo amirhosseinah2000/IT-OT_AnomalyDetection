@@ -1,0 +1,23 @@
+# Explicit production mode for large offline PCAP archives.
+# It is layered over config/default.yaml with --config; local Parquet remains the
+# portable source of truth and every protocol/capture retains its own artifact.
+capture:
+  # ``anomaly dataset run --all-packets`` enables this for one run. Keeping this
+  # false here prevents an accidental unlimited command when the config is used
+  # interactively.
+  streaming_unbounded: false
+  streaming_chunk_rows: 50000
+  streaming_return_sample_rows: 100000
+  streaming_max_active_flows: 200000
+  streaming_max_active_sources: 50000
+  streaming_max_destinations_per_source: 4096
+
+models:
+  # Fit is deliberately bounded and deterministic even when extraction stores
+  # tens of millions of PCAP-derived records. The rest remains available for
+  # batched scoring and future re-training; blindly fitting correlated packets
+  # from one flow is not a quality improvement.
+  max_source_rows: 250000
+
+runtime:
+  batch_size: 50000

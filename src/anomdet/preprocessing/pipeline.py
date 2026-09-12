@@ -123,6 +123,28 @@ def _limit_categories(
     return result, collapsed, vocabularies
 
 
+def _normalise_model_missing_values(frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert pandas extension missing values to NumPy-safe model inputs.
+
+    PyArrow/Parquet string columns commonly arrive as ``string`` dtype with
+    ``pd.NA``.  Scikit-learn's ``SimpleImputer`` expects ``np.nan`` for an
+    object categorical matrix; comparing a raw ``pd.NA`` to its configured
+    missing value raises ``TypeError: boolean value of NA is ambiguous``.
+    Keep the categorical values intact, but represent their missing values in
+    the unambiguous NumPy form before both fit and inference transforms.
+    """
+    result = frame.copy()
+    numeric_columns = result.select_dtypes(include=[np.number, "bool"]).columns
+    for column in numeric_columns:
+        result[column] = pd.to_numeric(result[column], errors="coerce").astype(float)
+    for column in result.columns:
+        if column in numeric_columns:
+            continue
+        values = result[column].astype("object")
+        result[column] = values.mask(pd.isna(values), np.nan)
+    return result
+
+
 def read_training_source(feature_path: Path, maximum_rows: int | None = None) -> pd.DataFrame:
     """Read a deterministic, time-spread model sample without exhausting RAM on large PCAP runs."""
     if maximum_rows is not None and maximum_rows < 1:
@@ -245,6 +267,7 @@ def prepare_features(
     matrix, collapsed_categories, category_vocabularies = _limit_categories(
         matrix, int(config["features"]["high_cardinality_max_categories"])
     )
+    matrix = _normalise_model_missing_values(matrix)
     report(
         {
             "event": "feature_transform_started",
@@ -333,6 +356,7 @@ def transform_with_manifest(
         matrix[column] = matrix[column].where(
             matrix[column].isin(allowed) | matrix[column].isna(), "__OTHER__"
         )
+    matrix = _normalise_model_missing_values(matrix)
     transformed = transformer.transform(matrix)
     names = transformer.get_feature_names_out().tolist()
     return pd.DataFrame(transformed, columns=names, index=source.index), names

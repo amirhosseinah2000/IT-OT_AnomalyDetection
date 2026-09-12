@@ -2,20 +2,53 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+from collections import Counter
+from collections.abc import Callable
+from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from anomdet.core.io import read_table, utc_now, write_json, write_table
 from anomdet.features.extractor import extract_pcap_features
 
 LOGGER = logging.getLogger("anomdet")
+MAPPING_CACHE_SCHEMA_VERSION = "1.0.0"
+PACKET_LINK_COLUMNS = [
+    "packet_uid",
+    "capture",
+    "packet_index",
+    "timestamp",
+    "flow_id",
+    "label",
+    "is_attack",
+    "match_status",
+    "match_confidence",
+    "csv_row",
+    "label_source_file",
+    "candidate_count",
+    "mapping_accepted",
+]
 FLOW_ID_PATTERN = re.compile(
     r"(?P<src_ip>(?:\d{1,3}\.){3}\d{1,3})[-:](?P<src_port>\d+)[-:](?P<dst_ip>(?:\d{1,3}\.){3}\d{1,3})[-:](?P<dst_port>\d+)"
 )
+
+
+class MappingCacheMismatchError(ValueError):
+    """A cached packet relation belongs to a different feature extraction.
+
+    This is an expected cache-miss condition, not a label-mapping failure.  The
+    caller must discard just this cache entry and rebuild the relation from the
+    PCAP features and CSV labels.
+    """
 
 
 def _safe_timestamp(value: object) -> pd.Timestamp:
@@ -497,6 +530,591 @@ def attach_flow_labels(features: pd.DataFrame, mapped_flows: pd.DataFrame) -> pd
         {"unknown", "benign", "normal", "-1", "nan", "<na>"}
     )
     return labelled
+
+
+def attach_packet_labels(
+    features: pd.DataFrame,
+    labels: pd.DataFrame,
+    config: dict[str, Any],
+    *,
+    offset_seconds: float = 0.0,
+) -> pd.DataFrame:
+    """Attach CSV evidence at packet time, retaining flow-compatible endpoints.
+
+    A capture can contain a long-lived TCP flow that transitions from benign
+    traffic into an attack. Mapping a single flow-start label to every packet
+    would erase that transition. This function uses the selected CSV, its
+    audited clock offset, and the existing endpoint matching rules to label
+    each PCAP-derived packet at its own timestamp.
+    """
+    result = features.copy()
+    result["_packet_order"] = np.arange(len(result), dtype=int)
+    aligned = labels.copy()
+    aligned["label_timestamp"] = pd.to_datetime(
+        aligned["label_timestamp"], errors="coerce", utc=True
+    ).astype("datetime64[ns, UTC]") + pd.to_timedelta(offset_seconds, unit="s")
+    aligned["label_end_timestamp"] = pd.to_datetime(
+        aligned["label_end_timestamp"], errors="coerce", utc=True
+    ).astype("datetime64[ns, UTC]") + pd.to_timedelta(offset_seconds, unit="s")
+    lookup = _candidate_index(aligned)
+    tolerance = float(config["mapping"]["timestamp_tolerance_seconds"])
+    allow_reverse = bool(config["mapping"].get("allow_reverse_flow_match", True))
+    label_columns = [
+        "label",
+        "label_timestamp",
+        "label_end_timestamp",
+        "csv_row",
+        "source_file",
+    ]
+    attached: list[pd.DataFrame] = []
+
+    for _, flow_packets in result.groupby("flow_id", sort=False, dropna=False):
+        scoped = flow_packets.sort_values("timestamp", kind="stable").copy()
+        flow = scoped.iloc[0]
+        candidates = _indexed_candidates(flow, aligned, lookup, allow_reverse)[label_columns].copy()
+        default = pd.DataFrame(
+            {
+                "label": config["mapping"]["default_label"],
+                "match_status": "unmatched",
+                "match_confidence": 0.0,
+                "csv_row": pd.NA,
+                "label_source_file": pd.NA,
+                "candidate_count": len(candidates),
+            },
+            index=scoped.index,
+        )
+        if candidates.empty:
+            attached.append(pd.concat([scoped, default], axis=1))
+            continue
+
+        candidates = candidates.dropna(subset=["label_timestamp"]).sort_values(
+            "label_timestamp", kind="stable"
+        )
+        if candidates.empty:
+            selected = _indexed_candidates(flow, aligned, lookup, allow_reverse).iloc[0]
+            default["label"] = selected["label"]
+            default["match_status"] = "matched_without_timestamp"
+            default["match_confidence"] = 0.7
+            default["csv_row"] = selected["csv_row"]
+            default["label_source_file"] = selected["source_file"]
+            attached.append(pd.concat([scoped, default], axis=1))
+            continue
+
+        packet_times = pd.DataFrame(
+            {
+                "_packet_index": scoped.index,
+                "_packet_time": pd.to_datetime(
+                    scoped["timestamp"], errors="coerce", utc=True
+                ).astype("datetime64[ns, UTC]"),
+            },
+            index=scoped.index,
+        ).sort_values("_packet_time", kind="stable")
+        candidate_times = candidates.rename(columns={"label_timestamp": "_label_time"})
+        prior = pd.merge_asof(
+            packet_times,
+            candidate_times,
+            left_on="_packet_time",
+            right_on="_label_time",
+            direction="backward",
+            allow_exact_matches=True,
+        ).set_index("_packet_index")
+        interval_match = prior["label_end_timestamp"].notna() & (
+            prior["_packet_time"] <= prior["label_end_timestamp"]
+        )
+        nearest = pd.merge_asof(
+            packet_times,
+            candidate_times,
+            left_on="_packet_time",
+            right_on="_label_time",
+            direction="nearest",
+            tolerance=pd.Timedelta(seconds=tolerance),
+            allow_exact_matches=True,
+        ).set_index("_packet_index")
+        selected = prior.where(interval_match, nearest).reindex(scoped.index)
+        matched = selected["label"].notna()
+        interval_for_rows = interval_match.reindex(scoped.index).fillna(False)
+        default.loc[matched, "label"] = selected.loc[matched, "label"].astype("string")
+        default.loc[matched & interval_for_rows, "match_status"] = "matched_interval"
+        nearest_match = matched & ~interval_for_rows
+        default.loc[nearest_match, "match_status"] = "matched_packet_time"
+        default.loc[matched & interval_for_rows, "match_confidence"] = 0.98
+        distance = (selected["_packet_time"] - selected["_label_time"]).abs().dt.total_seconds()
+        default.loc[nearest_match, "match_confidence"] = (
+            0.95
+            - distance.loc[nearest_match].clip(lower=0, upper=tolerance) / max(tolerance, 1) * 0.2
+        ).clip(lower=0.6)
+        default.loc[matched, "csv_row"] = selected.loc[matched, "csv_row"].to_numpy()
+        default.loc[matched, "label_source_file"] = selected.loc[matched, "source_file"].to_numpy()
+        attached.append(pd.concat([scoped, default], axis=1))
+
+    labelled = pd.concat(attached, ignore_index=False, sort=False)
+    labelled = labelled.sort_values("_packet_order", kind="stable").drop(columns="_packet_order")
+    labelled["is_attack"] = labelled["label"].astype("string").str.casefold().isin(
+        {"attack", "anomaly", "malicious"}
+    ) | ~labelled["label"].astype("string").str.casefold().isin(
+        {"unknown", "benign", "normal", "-1", "nan", "<na>"}
+    )
+    return labelled.reset_index(drop=True)
+
+
+def _canonical_labelled_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Stabilise CSV-derived columns across independently processed row groups."""
+
+    result = frame.copy()
+    for column in ["label", "match_status", "label_source_file", "dataset_split"]:
+        if column in result:
+            result[column] = result[column].astype("string")
+    for column in ["match_confidence", "csv_row", "candidate_count"]:
+        if column in result:
+            result[column] = pd.to_numeric(result[column], errors="coerce").astype("float64")
+    for column in ["is_attack", "mapping_accepted"]:
+        if column in result:
+            result[column] = result[column].fillna(False).astype(bool)
+    return result
+
+
+def attach_packet_labels_parquet(
+    feature_path: Path,
+    output_path: Path,
+    labels: pd.DataFrame,
+    config: dict[str, Any],
+    *,
+    offset_seconds: float = 0.0,
+    mapping_accepted: bool,
+    batch_rows: int = 50_000,
+    batch_callback: Callable[[pd.DataFrame], None] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Label a large PCAP-derived Parquet table without loading it into RAM.
+
+    Packet-time labels are independent for each packet once the CSV clock offset
+    and endpoint lookup have been audited.  Processing row groups independently
+    therefore preserves label correctness for long flows while keeping memory
+    proportional to ``batch_rows``.
+    """
+
+    if batch_rows < 1:
+        raise ValueError("batch_rows must be positive.")
+    source = pq.ParquetFile(feature_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer: pq.ParquetWriter | None = None
+    rows = 0
+    attack_records = 0
+    matched_records = 0
+    batches = 0
+    label_counts: Counter[tuple[str, bool]] = Counter()
+    try:
+        for batch in source.iter_batches(batch_size=batch_rows):
+            features = batch.to_pandas()
+            labelled = attach_packet_labels(features, labels, config, offset_seconds=offset_seconds)
+            labelled["mapping_accepted"] = mapping_accepted
+            labelled["dataset_split"] = "attack"
+            labelled = _canonical_labelled_frame(labelled)
+            table = pa.Table.from_pandas(labelled, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    output_path, table.schema, compression="zstd", use_dictionary=True
+                )
+            writer.write_table(table, row_group_size=batch_rows)
+            rows += len(labelled)
+            attack_records += int(labelled["is_attack"].sum())
+            matched_records += int(labelled["match_status"].ne("unmatched").sum())
+            batches += 1
+            label_counts.update(
+                (str(label), bool(is_attack))
+                for label, is_attack in labelled[["label", "is_attack"]].itertuples(
+                    index=False, name=None
+                )
+            )
+            if batch_callback is not None:
+                batch_callback(labelled)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "event": "packet_mapping_progress",
+                        "rows_processed": rows,
+                        "attack_records": attack_records,
+                        "matched_records": matched_records,
+                        "batches_completed": batches,
+                        "batch_rows": batch_rows,
+                    }
+                )
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is None:
+        # A valid empty source is still a valid labelled artifact.  It has no
+        # rows, so a direct empty copy is safer than inventing a schema.
+        empty = source.read().to_pandas().iloc[0:0]
+        empty["label"] = pd.Series(dtype="string")
+        empty["is_attack"] = pd.Series(dtype=bool)
+        empty["mapping_accepted"] = pd.Series(dtype=bool)
+        empty["dataset_split"] = pd.Series(dtype="string")
+        pq.write_table(pa.Table.from_pandas(empty, preserve_index=False), output_path)
+    return {
+        "rows": rows,
+        "attack_records": attack_records,
+        "matched_records": matched_records,
+        "batches_completed": batches,
+        "label_counts": [
+            {"label": label, "is_attack": is_attack, "records": records}
+            for (label, is_attack), records in sorted(label_counts.items())
+        ],
+        "batch_rows": batch_rows,
+    }
+
+
+def set_mapping_acceptance_parquet(
+    path: Path, accepted: bool, *, batch_rows: int = 50_000
+) -> None:
+    """Correct the decision bit without repeating packet-to-CSV matching."""
+
+    source = pq.ParquetFile(path)
+    temporary = path.with_suffix(".acceptance-rewrite.parquet")
+    writer: pq.ParquetWriter | None = None
+    try:
+        for batch in source.iter_batches(batch_size=batch_rows):
+            frame = batch.to_pandas()
+            frame["mapping_accepted"] = bool(accepted)
+            frame = _canonical_labelled_frame(frame)
+            table = pa.Table.from_pandas(frame, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    temporary, table.schema, compression="zstd", use_dictionary=True
+                )
+            writer.write_table(table, row_group_size=batch_rows)
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is None:
+        raise ValueError("Cannot update mapping acceptance on an empty labelled table.")
+    temporary.replace(path)
+
+
+def packet_label_coverage_parquet(
+    feature_path: Path,
+    labels: pd.DataFrame,
+    config: dict[str, Any],
+    *,
+    offset_seconds: float = 0.0,
+    batch_rows: int = 50_000,
+) -> dict[str, Any]:
+    """Verify packet-time label coverage before marking a streamed mapping usable."""
+
+    if batch_rows < 1:
+        raise ValueError("batch_rows must be positive.")
+    source = pq.ParquetFile(feature_path)
+    rows = 0
+    attack_records = 0
+    label_counts: Counter[tuple[str, bool]] = Counter()
+    for batch in source.iter_batches(batch_size=batch_rows):
+        labelled = attach_packet_labels(
+            batch.to_pandas(), labels, config, offset_seconds=offset_seconds
+        )
+        rows += len(labelled)
+        attack_records += int(labelled["is_attack"].sum())
+        label_counts.update(
+            (str(label), bool(is_attack))
+            for label, is_attack in labelled[["label", "is_attack"]].itertuples(
+                index=False, name=None
+            )
+        )
+    return {
+        "rows": rows,
+        "attack_records": attack_records,
+        "label_counts": [
+            {"label": label, "is_attack": is_attack, "records": records}
+            for (label, is_attack), records in sorted(label_counts.items())
+        ],
+        "batch_rows": batch_rows,
+    }
+
+
+def mapping_cache_plan(
+    config: dict[str, Any],
+    *,
+    protocol: str,
+    capture_path: Path,
+    label_paths: list[Path],
+    max_packets: int | None,
+) -> dict[str, Any]:
+    """Describe a reusable packet-to-CSV mapping cache entry.
+
+    Cache validity is deliberately based on portable operational inputs rather
+    than a run directory: source names, size, modification time, all CSV
+    candidates, mapping policy, protocol, and selected packet limit. A copied
+    project therefore can reuse the relation when those source snapshots are
+    preserved. Adding/changing a PCAP or CSV produces a different key
+    automatically. ``--remap`` can still rebuild an unchanged entry explicitly.
+    """
+
+    mapping = config.get("mapping", {})
+
+    def snapshot(path: Path) -> dict[str, Any]:
+        stat = path.stat()
+        return {
+            "name": path.name,
+            "size_bytes": int(stat.st_size),
+            "modified_ns": int(stat.st_mtime_ns),
+        }
+
+    # Cache controls must not invalidate an otherwise identical mapping.
+    policy = {
+        key: value
+        for key, value in mapping.items()
+        if key
+        not in {
+            "cache_enabled",
+            "cache_directory",
+            "cache_schema_version",
+        }
+    }
+    identity = {
+        "schema_version": str(mapping.get("cache_schema_version", MAPPING_CACHE_SCHEMA_VERSION)),
+        "packet_identity": "capture_name_plus_original_packet_index/v1",
+        "protocol": protocol.casefold(),
+        "capture": snapshot(capture_path),
+        "label_candidates": [snapshot(path) for path in sorted(label_paths)],
+        "max_packets_per_capture": max_packets,
+        "mapping_policy": policy,
+    }
+    canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str)
+    signature = sha256(canonical.encode("utf-8")).hexdigest()[:24]
+    root = (
+        Path(config["project"]["artifact_dir"])
+        / str(mapping.get("cache_directory", "mapping_cache"))
+        / f"v{MAPPING_CACHE_SCHEMA_VERSION.split('.', maxsplit=1)[0]}"
+        / protocol.casefold()
+        / signature
+    )
+    return {
+        "enabled": bool(mapping.get("cache_enabled", True)),
+        "signature": signature,
+        "root": root,
+        "identity": identity,
+        "metadata_path": root / "mapping-cache.json",
+        "flow_path": root / "flow-evidence.parquet",
+        "links_path": root / "packet-csv-links.parquet",
+    }
+
+
+def load_mapping_cache(plan: dict[str, Any]) -> dict[str, Any] | None:
+    """Load one valid cache entry, or return ``None`` without hiding a miss."""
+
+    if not plan["enabled"]:
+        return None
+    metadata_path = Path(plan["metadata_path"])
+    flow_path = Path(plan["flow_path"])
+    links_path = Path(plan["links_path"])
+    if not (metadata_path.is_file() and flow_path.is_file() and links_path.is_file()):
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        LOGGER.warning("MAPPING_CACHE_INVALID cache=%s reason=invalid_metadata", metadata_path)
+        return None
+    if (
+        metadata.get("schema_version") != MAPPING_CACHE_SCHEMA_VERSION
+        or metadata.get("signature") != plan["signature"]
+    ):
+        LOGGER.info("MAPPING_CACHE_STALE cache=%s", metadata_path)
+        return None
+    try:
+        link_rows = int(pq.ParquetFile(links_path).metadata.num_rows)
+        flow_evidence = read_table(flow_path)
+    except Exception as error:  # pragma: no cover - corrupt external cache.
+        LOGGER.warning("MAPPING_CACHE_INVALID cache=%s reason=%s", metadata_path, error)
+        return None
+    metadata["packet_link_rows"] = link_rows
+    return {"metadata": metadata, "flow_evidence": flow_evidence, "links_path": links_path}
+
+
+def _packet_link_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Keep a portable, feature-independent relation from one packet to one CSV row."""
+
+    missing = set(PACKET_LINK_COLUMNS).difference(frame.columns)
+    if missing:
+        raise ValueError(f"Labelled packet output is missing cache-link fields: {sorted(missing)}")
+    links = _canonical_labelled_frame(frame[PACKET_LINK_COLUMNS])
+    links["packet_uid"] = links["packet_uid"].astype("string")
+    links["capture"] = links["capture"].astype("string")
+    links["flow_id"] = links["flow_id"].astype("string")
+    links["packet_index"] = pd.to_numeric(links["packet_index"], errors="coerce").astype(
+        "float64"
+    )
+    links["timestamp"] = pd.to_datetime(links["timestamp"], errors="coerce", utc=True)
+    return links
+
+
+def save_mapping_cache(
+    plan: dict[str, Any],
+    *,
+    flow_evidence: pd.DataFrame,
+    labelled_path: Path,
+    metadata: dict[str, Any],
+    batch_rows: int = 50_000,
+) -> dict[str, Any]:
+    """Persist full packet↔CSV links once for later run- and model-independent reuse."""
+
+    if not plan["enabled"]:
+        return {"saved": False, "rows": 0}
+    if batch_rows < 1:
+        raise ValueError("batch_rows must be positive.")
+    root = Path(plan["root"])
+    root.mkdir(parents=True, exist_ok=True)
+    write_table(flow_evidence, Path(plan["flow_path"]))
+    writer: pq.ParquetWriter | None = None
+    rows = 0
+    source = pq.ParquetFile(labelled_path)
+    try:
+        for batch in source.iter_batches(batch_size=batch_rows):
+            links = _packet_link_frame(batch.to_pandas())
+            table = pa.Table.from_pandas(links, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    Path(plan["links_path"]), table.schema, compression="zstd", use_dictionary=True
+                )
+            writer.write_table(table, row_group_size=batch_rows)
+            rows += len(links)
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is None:
+        raise ValueError("Cannot cache an empty labelled packet table.")
+    payload = {
+        "schema_version": MAPPING_CACHE_SCHEMA_VERSION,
+        "signature": plan["signature"],
+        "created_at": datetime.now(UTC).isoformat(),
+        "identity": plan["identity"],
+        "artifacts": {
+            "flow_evidence": Path(plan["flow_path"]).name,
+            "packet_csv_links": Path(plan["links_path"]).name,
+        },
+        "packet_link_rows": rows,
+        **metadata,
+    }
+    write_json(payload, Path(plan["metadata_path"]))
+    LOGGER.info(
+        "MAPPING_CACHE_SAVED protocol=%s signature=%s packet_links=%s path=%s",
+        plan["identity"]["protocol"],
+        plan["signature"],
+        rows,
+        root,
+    )
+    return {"saved": True, "rows": rows, "root": str(root)}
+
+
+def apply_cached_packet_labels_parquet(
+    feature_path: Path,
+    links_path: Path,
+    output_path: Path,
+    *,
+    batch_rows: int = 50_000,
+    batch_callback: Callable[[pd.DataFrame], None] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Re-attach a validated cache relation without comparing any PCAP/CSV rows again.
+
+    Feature extraction may complete worker batches in a different order on two
+    runs.  ``packet_uid`` (capture plus original PCAP packet index) is the
+    invariant relation key, so cache application deliberately joins by that
+    key instead of assuming that two Parquet files have identical row order.
+    """
+
+    if batch_rows < 1:
+        raise ValueError("batch_rows must be positive.")
+    features = pq.ParquetFile(feature_path)
+    cached_links = _packet_link_frame(read_table(links_path))
+    if len(cached_links) != int(features.metadata.num_rows):
+        raise MappingCacheMismatchError(
+            "Cached packet links have a different row count than feature records."
+        )
+    if not cached_links["packet_uid"].is_unique:
+        raise MappingCacheMismatchError("Cached packet links contain duplicate packet identifiers.")
+    cached_links = cached_links.set_index("packet_uid", drop=False)
+    remaining_packet_uids = set(cached_links.index.astype(str).tolist())
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer: pq.ParquetWriter | None = None
+    rows = 0
+    attack_records = 0
+    matched_records = 0
+    batches = 0
+    label_counts: Counter[tuple[str, bool]] = Counter()
+    feature_batches = features.iter_batches(batch_size=batch_rows)
+    try:
+        for feature_batch in feature_batches:
+            feature_frame = feature_batch.to_pandas()
+            packet_uids = feature_frame["packet_uid"].astype("string").astype(str).tolist()
+            batch_packet_uids = set(packet_uids)
+            if len(batch_packet_uids) != len(packet_uids) or not batch_packet_uids.issubset(
+                remaining_packet_uids
+            ):
+                raise MappingCacheMismatchError(
+                    "Cached links do not match this feature extraction; mapping will be rebuilt."
+                )
+            link_frame = cached_links.loc[packet_uids].reset_index(drop=True)
+            remaining_packet_uids.difference_update(batch_packet_uids)
+            mapping_fields = link_frame.drop(
+                columns=["packet_uid", "capture", "packet_index", "timestamp", "flow_id"]
+            )
+            labelled = pd.concat(
+                [feature_frame.reset_index(drop=True), mapping_fields.reset_index(drop=True)],
+                axis=1,
+            )
+            labelled = _canonical_labelled_frame(labelled)
+            table = pa.Table.from_pandas(labelled, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    output_path, table.schema, compression="zstd", use_dictionary=True
+                )
+            writer.write_table(table, row_group_size=batch_rows)
+            rows += len(labelled)
+            attack_records += int(labelled["is_attack"].sum())
+            matched_records += int(labelled["match_status"].ne("unmatched").sum())
+            batches += 1
+            label_counts.update(
+                (str(label), bool(is_attack))
+                for label, is_attack in labelled[["label", "is_attack"]].itertuples(
+                    index=False, name=None
+                )
+            )
+            if batch_callback is not None:
+                batch_callback(labelled)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "event": "mapping_cache_apply_progress",
+                        "rows_processed": rows,
+                        "attack_records": attack_records,
+                        "cache_path": str(links_path),
+                    }
+                )
+        if remaining_packet_uids:
+            raise MappingCacheMismatchError(
+                "Cached packet links contain identifiers absent from this feature extraction."
+            )
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is None:
+        raise ValueError("Cannot apply a cache relation to an empty feature table.")
+    LOGGER.info(
+        "MAPPING_CACHE_APPLIED packet_links=%s rows=%s attack_records=%s",
+        links_path,
+        rows,
+        attack_records,
+    )
+    return {
+        "rows": rows,
+        "attack_records": attack_records,
+        "matched_records": matched_records,
+        "batches_completed": batches,
+        "label_counts": [
+            {"label": label, "is_attack": is_attack, "records": records}
+            for (label, is_attack), records in sorted(label_counts.items())
+        ],
+        "batch_rows": batch_rows,
+    }
 
 
 def map_pcap_to_labels(

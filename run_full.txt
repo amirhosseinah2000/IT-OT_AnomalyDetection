@@ -1,0 +1,51 @@
+cd /mnt/d/anomaly-detection/models/Test/Models
+uv sync
+
+RUN="artifacts/runs/full-$(date +%Y%m%d-%H%M%S)"
+
+uv run anomaly dataset run --output "$RUN" --max-packets 5000
+
+uv run anomaly two-stage train "$RUN" --protocol dns    --output "$RUN/models/dns"
+uv run anomaly two-stage train "$RUN" --protocol http   --output "$RUN/models/http"
+uv run anomaly two-stage train "$RUN" --protocol modbus --output "$RUN/models/modbus"
+uv run anomaly two-stage train "$RUN" --protocol s7comm --output "$RUN/models/s7comm"
+
+uv run anomaly dashboard
+
+
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+cd /mnt/d/anomaly-detection/models/Test/Models
+
+uv sync
+
+RUN="artifacts/runs/full-$(date +%Y%m%d-%H%M%S)"
+
+uv run anomaly dataset inspect
+uv run anomaly dataset run --output "$RUN" --max-packets 5000
+
+uv run anomaly two-stage train "$RUN" --protocol dns \
+  --output "$RUN/models/dns"
+
+uv run anomaly two-stage train "$RUN" --protocol http \
+  --output "$RUN/models/http"
+
+uv run anomaly two-stage train "$RUN" --protocol modbus \
+  --output "$RUN/models/modbus"
+
+uv run anomaly two-stage train "$RUN" --protocol s7comm \
+  --output "$RUN/models/s7comm"
+
+uv run anomaly dashboard
+
+
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+cd /mnt/d/anomaly-detection/models/Test/Models
+
+RUN="artifacts/runs/full-$(date +%Y%m%d-%H%M%S)"
+
+uv run anomaly dataset inspect
+uv run anomaly dataset run --output "$RUN" --max-packets 3000000

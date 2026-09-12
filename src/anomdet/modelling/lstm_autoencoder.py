@@ -220,6 +220,59 @@ class LSTMAutoencoder:
         windows = np.stack([clean[start : start + length] for start in starts]).astype(np.float32)
         return windows, starts
 
+    def _grouped_windows(
+        self, values: np.ndarray, sequence_groups: np.ndarray | list[object]
+    ) -> tuple[np.ndarray, list[np.ndarray]]:
+        """Create windows within a capture/stream group, never across its boundary.
+
+        The historic implementation treated a concatenation of PCAP captures as
+        one long sequence.  That creates artificial sequences at every capture
+        boundary and can make a normal capture look less reconstructable than
+        an attack capture.  Each returned reference array maps a window position
+        back to its original source row so per-packet scores retain input order.
+        """
+
+        clean = self._clean(values)
+        groups = np.asarray(sequence_groups, dtype=object)
+        if len(groups) != len(clean):
+            raise ValueError("sequence_groups must contain one value per feature row.")
+        length = min(self.sequence_length, len(clean))
+        stride = min(self.sequence_stride, length)
+        windows: list[np.ndarray] = []
+        references: list[np.ndarray] = []
+        # ``dict.fromkeys`` preserves first-seen capture order without requiring
+        # string-sortable group values.
+        for group in dict.fromkeys(groups.tolist()):
+            positions = np.flatnonzero(groups == group)
+            if not len(positions):
+                continue
+            starts = list(range(0, max(len(positions) - length + 1, 1), stride))
+            final_start = max(0, len(positions) - length)
+            if starts[-1] != final_start:
+                starts.append(final_start)
+            for start in starts:
+                reference = positions[start : start + length]
+                # Very short captures still need a fixed LSTM shape. Repeating
+                # the final real packet is deterministic and is excluded from
+                # neither training nor scoring; the final packet's score is
+                # averaged over its repeated context positions.
+                if len(reference) < length:
+                    reference = np.pad(reference, (0, length - len(reference)), mode="edge")
+                references.append(reference)
+                windows.append(clean[reference])
+        if not windows:
+            raise ValueError("No sequence windows could be created from the supplied groups.")
+        return np.stack(windows).astype(np.float32), references
+
+    def _sequence_windows(
+        self, values: np.ndarray, sequence_groups: np.ndarray | list[object] | None
+    ) -> tuple[np.ndarray, list[int] | list[np.ndarray]]:
+        """Choose legacy contiguous windows or boundary-safe grouped windows."""
+
+        if sequence_groups is None:
+            return self._windows(values)
+        return self._grouped_windows(values, sequence_groups)
+
     @staticmethod
     def _evenly_sample(windows: np.ndarray, maximum: int) -> np.ndarray:
         """Cap training cost without biasing the sequence sample to early traffic."""
@@ -239,10 +292,11 @@ class LSTMAutoencoder:
         self,
         values: np.ndarray,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        sequence_groups: np.ndarray | list[object] | None = None,
     ) -> LSTMAutoencoder:
         """Fit the reconstruction model and optionally report epoch-level live progress."""
         torch, _nn = _torch_modules()
-        windows, _starts = self._windows(values)
+        windows, _references = self._sequence_windows(values, sequence_groups)
         sampled = self._evenly_sample(windows, self.max_train_windows)
         validation_count = int(round(len(sampled) * self.validation_fraction))
         if validation_count >= len(sampled) - 1:
@@ -377,7 +431,9 @@ class LSTMAutoencoder:
             )
         return self
 
-    def score_samples(self, values: np.ndarray) -> np.ndarray:
+    def score_samples(
+        self, values: np.ndarray, sequence_groups: np.ndarray | list[object] | None = None
+    ) -> np.ndarray:
         """Return one reconstruction-MSE anomaly score per source record."""
         if self.model_ is None or self.input_size_ is None or self.device_ is None:
             raise RuntimeError("Fit the LSTM autoencoder before scoring samples.")
@@ -385,7 +441,7 @@ class LSTMAutoencoder:
         clean = self._clean(values)
         if clean.shape[1] != self.input_size_:
             raise ValueError("Input feature count does not match the fitted LSTM autoencoder.")
-        windows, starts = self._windows(clean)
+        windows, references = self._sequence_windows(clean, sequence_groups)
         errors: list[np.ndarray] = []
         self.model_.eval()
         with torch.no_grad():
@@ -397,10 +453,15 @@ class LSTMAutoencoder:
         window_errors = np.concatenate(errors, axis=0)
         total = np.zeros(len(clean), dtype=float)
         counts = np.zeros(len(clean), dtype=float)
-        sequence_length = window_errors.shape[1]
-        for start, error in zip(starts, window_errors, strict=True):
-            total[start : start + sequence_length] += error
-            counts[start : start + sequence_length] += 1
+        if sequence_groups is None:
+            sequence_length = window_errors.shape[1]
+            for start, error in zip(references, window_errors, strict=True):
+                total[start : start + sequence_length] += error
+                counts[start : start + sequence_length] += 1
+        else:
+            for reference, error in zip(references, window_errors, strict=True):
+                np.add.at(total, reference, error)
+                np.add.at(counts, reference, 1.0)
         return total / np.maximum(counts, 1.0)
 
     def save(self, path: Path) -> Path:

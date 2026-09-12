@@ -27,6 +27,11 @@ data:
   # Optional explicit matches for files that deliberately have unrelated names.
   # The automatic mapper still verifies endpoint and time evidence before using a label.
   attack_pair_overrides: {}
+  # Optional targeted selection for a quick smoke test or re-processing one
+  # capture.  Omit it for the complete folder-first dataset run.
+  # capture_allowlist:
+  #   benign: {dns: [dns3.pcapng]}
+  #   attack: {dns: [BrowserHijacking_DNS.pcap]}
   # Legacy one-file-at-a-time inventory. Keep empty when using protocol folders.
   # PCAP and label paths may be absolute or relative to their configured roots.
   datasets: []
@@ -45,6 +50,24 @@ runtime:
 
 capture:
   supported_protocols: [ssh, dns, http, modbus, s7comm]
+  # A dataset run scans every source PCAP but retains a deterministic,
+  # time-spread sample per capture.  This prevents a multi-million-packet
+  # capture from exhausting WSL/host memory during feature aggregation.
+  # Override with `anomaly dataset run --max-packets N` for a larger study.
+  dataset_default_packet_cap: 5000
+  # Large final runs switch automatically to a disk-backed, causal extractor.
+  # It writes fixed-size Parquet row groups and never materializes the selected
+  # PCAP records in one DataFrame. Keep the default cap for a safe first run;
+  # use --all-packets only with an explicit streaming production config.
+  streaming_enabled: true
+  streaming_unbounded: false
+  streaming_threshold_packets: 200000
+  streaming_reservoir_threshold_packets: 200000
+  streaming_chunk_rows: 50000
+  streaming_return_sample_rows: 100000
+  streaming_max_active_flows: 200000
+  streaming_max_active_sources: 50000
+  streaming_max_destinations_per_source: 4096
   flow_idle_timeout_seconds: 60
   behavior_window_seconds: 60
   default_interface: null
@@ -55,6 +78,13 @@ capture:
     multiplier: 1.0
 
 mapping:
+  # A complete packet↔CSV relation is built once per unchanged PCAP/CSV pair
+  # and reused by later dataset runs. The key includes source size/mtime,
+  # mapping policy, protocol, and packet cap; use `dataset run --remap` only
+  # for an intentional rebuild of unchanged inputs.
+  cache_enabled: true
+  cache_directory: mapping_cache
+  cache_schema_version: 1.0.0
   timestamp_tolerance_seconds: 5.0
   minimum_match_rate: 0.90
   minimum_match_confidence: 0.90
@@ -112,19 +142,20 @@ models:
     nu: 0.05
     gamma: scale
   lstm_autoencoder:
-    # Reference-aligned Modbus LSTM-AE defaults. Windows preserve packet/flow
-    # order within a protocol; the validation split is chronological.
-    sequence_length: 10
-    sequence_stride: 10
-    hidden_size: 128
-    latent_size: 64
-    num_layers: 2
-    dropout: 0.2
+    # The network resolves from the selected feature profile.  This keeps the
+    # CPU model compact even when a user changes the number of input features.
+    # Windows preserve packet/flow order within a protocol; validation is chronological.
+    sequence_length: 8
+    sequence_stride: 8
+    hidden_size: null
+    latent_size: null
+    num_layers: null
+    dropout: 0.1
     learning_rate: 0.001
     batch_size: 256
-    epochs: 100
+    epochs: 60
     validation_fraction: 0.15
-    patience: 15
+    patience: 10
     # Caps fit cost while score generation still covers every held-out record.
     max_train_windows: 5000
     device: cpu
@@ -168,12 +199,70 @@ storage:
     secure: false
 
 stage_one:
-  target_false_positive_rate: 0.01
+  # ``validation_fraction`` is reserved twice: once for threshold calibration
+  # and once for a later untouched normal-evaluation slice. The ensemble
+  # threshold therefore has an explicit FPR objective without making the
+  # reported FPR optimistic.
+  target_false_positive_rate: 0.005
   validation_fraction: 0.20
-  ensemble_mode: either_detector
+  # A small temporal slice of accepted CSV/PCAP rows explicitly labelled
+  # BENIGN calibrates the threshold only; it never enters detector fitting and
+  # the remaining mapped benign rows stay in the evaluation metric.
+  calibration_include_mapped_benign: true
+  # Joint max score preserves a strong signal from either detector; its single
+  # threshold is still calibrated on known benign traffic to enforce the FPR budget.
+  ensemble_mode: calibrated_max
+  ensemble_weights:
+    lstm: 0.55
+    isolation_forest: 0.45
+    # Only two agreeing detectors receive this bonus; a single detector can
+    # still alert when its evidence is strong enough.
+    agreement_bonus: 0.20
+  # The novelty ensemble remains active for unknown attacks. When packet-time
+  # CSV labels span several distinct attack captures, this compact calibrated
+  # binary gate learns the known attack-vs-normal boundary as well. It is never
+  # fitted from unlabelled attack-PCAP packets and is skipped rather than
+  # fabricated when label coverage is inadequate (for example current Modbus).
+  supervised_gate:
+    enabled: true
+    min_labelled_attack_records: 50
+    learning_rate: 0.08
+    max_iter: 180
+    max_leaf_nodes: 15
+    min_samples_leaf: 20
+    l2_regularization: 1.0
+    validation_fraction: 0.15
 
 stage_two:
+  # Stage 2 is optional. If accepted CSV labels do not meet these conditions,
+  # training still builds and evaluates the Stage 1 anomaly detector only.
+  enabled: true
+  min_training_records: 20
+  min_records_per_class: 4
+  require_multiple_attack_types: true
+  # Prefer a capture-held-out test split. The implementation falls back to a
+  # stratified packet split only when captures cannot preserve every class.
   test_fraction: 0.20
-  n_estimators: 300
+  n_estimators: 250
   min_samples_leaf: 2
+  max_features: sqrt
+  max_samples: 0.90
+  max_depth: null
   include_stage_one_scores: true
+
+# Evaluation artifacts are stored beside every trained protocol model. These
+# bounded settings keep the default CPU-only run practical while making the
+# dashboard's end-to-end charts reproducible outside Streamlit as Parquet.
+evaluation:
+  threshold_points: 41
+  latency_sample_records: 2000
+  stage2_diagnostic_estimators: 40
+  # Seed-stability charts are auxiliary refits; they must not multiply the
+  # CPU cost of the deployed 250-tree classifier.
+  seed_stability_estimators: 40
+  diagnostic_cpu_workers: 4
+  permutation_repeats: 3
+  stage1_learning_curve_epochs: 20
+  # Stage 1 remains frozen here; each seed retrains only Stage 2 on the same
+  # split. This separates classifier seed variance from Stage 1 variance.
+  seed_stability_seeds: [17, 37, 73, 101, 211]

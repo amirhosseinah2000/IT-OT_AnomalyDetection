@@ -83,10 +83,41 @@ def _manual_pairs(config: dict[str, Any], protocol: str) -> dict[str, str]:
     return values if isinstance(values, dict) else {}
 
 
+def _capture_allowlist(
+    config: dict[str, Any], split: str, protocol: str, directory: Path
+) -> list[Path]:
+    """Resolve an optional, explicit per-protocol capture selection.
+
+    Production discovery remains folder-first.  ``capture_allowlist`` exists
+    for deterministic smoke tests and targeted re-processing, where scanning
+    every large PCAP would obscure the purpose of the run.  Each configured
+    filename is checked eagerly so a typo can never silently produce an empty
+    protocol dataset.
+    """
+    available = resolve_capture_paths(directory)
+    declared = config.get("data", {}).get("capture_allowlist", {})
+    split_values = declared.get(split, {}) if isinstance(declared, dict) else {}
+    requested = split_values.get(protocol) if isinstance(split_values, dict) else None
+    if requested is None:
+        return available
+    if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
+        raise ValueError(
+            "data.capture_allowlist entries must be lists of capture filenames "
+            f"(invalid value for {split}/{protocol})."
+        )
+    by_name = {path.name: path for path in available}
+    missing = [name for name in requested if name not in by_name]
+    if missing:
+        raise FileNotFoundError(
+            f"Configured {split}/{protocol} captures do not exist in {directory}: {missing}"
+        )
+    return [by_name[name] for name in requested]
+
+
 def _pair_protocol(
     config: dict[str, Any], protocol: str, pcap_dir: Path, label_dir: Path
 ) -> list[AttackPair]:
-    captures = resolve_capture_paths(pcap_dir)
+    captures = _capture_allowlist(config, "attack", protocol, pcap_dir)
     labels = sorted(label_dir.glob("*.csv"), key=lambda path: path.name.casefold())
     if not labels:
         return []
@@ -141,13 +172,13 @@ def discover_dataset(config: dict[str, Any]) -> dict[str, Any]:
         if benign_dir.is_dir():
             benign.extend(
                 CaptureSource("benign", protocol, path)
-                for path in resolve_capture_paths(benign_dir)
+                for path in _capture_allowlist(config, "benign", protocol, benign_dir)
             )
         attack_dir, label_dir = attack_pcap_root / protocol, attack_label_root / protocol
         if attack_dir.is_dir():
             attack_captures.extend(
                 CaptureSource("attack", protocol, path)
-                for path in resolve_capture_paths(attack_dir)
+                for path in _capture_allowlist(config, "attack", protocol, attack_dir)
             )
         if attack_dir.is_dir() and label_dir.is_dir():
             attack_pairs.extend(_pair_protocol(config, protocol, attack_dir, label_dir))

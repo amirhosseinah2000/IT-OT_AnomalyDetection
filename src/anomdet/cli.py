@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
@@ -29,7 +30,11 @@ from anomdet.modelling.two_stage import (
     train_two_stage,
 )
 from anomdet.orchestration.batch import run_inventory
-from anomdet.orchestration.dataset_pipeline import run_dataset_pipeline
+from anomdet.orchestration.dataset_pipeline import (
+    run_dataset_extraction,
+    run_dataset_mapping,
+    run_dataset_pipeline,
+)
 from anomdet.preprocessing.pipeline import prepare_features
 from anomdet.selection.profiles import create_profile, feature_quality_report, load_profile
 
@@ -227,7 +232,10 @@ def pipeline_run(
     ] = None,
     max_packets: Annotated[
         int | None,
-        typer.Option(min=1, help="Cap packets per capture for a controlled trial run."),
+        typer.Option(
+            min=1,
+            help="Override the configured safe packet cap per capture for this dataset run.",
+        ),
     ] = None,
 ) -> None:
     """Extract all configured PCAPs, test label candidates, and produce one run summary."""
@@ -275,12 +283,40 @@ def dataset_run(
     ] = None,
     max_packets: Annotated[
         int | None,
-        typer.Option(min=1, help="Cap packets per capture for a controlled trial run."),
+        typer.Option(
+            min=1,
+            help="Cap packets per capture; large values automatically use disk-backed streaming.",
+        ),
     ] = None,
+    all_packets: Annotated[
+        bool,
+        typer.Option(
+            "--all-packets",
+            help=(
+                "Process every packet with the disk-backed streaming extractor; "
+                "requires disk space."
+            ),
+        ),
+    ] = False,
+    remap: Annotated[
+        bool,
+        typer.Option(
+            "--remap",
+            help="Ignore a matching packet-to-CSV cache and build a fresh exhaustive mapping.",
+        ),
+    ] = False,
 ) -> None:
     """Extract protocol-separated PCAP features and verify all CSV label mappings."""
     try:
-        summary, summary_path = run_dataset_pipeline(_context_config(context), output, max_packets)
+        if all_packets and max_packets is not None:
+            raise typer.BadParameter("Choose either --max-packets or --all-packets, not both.")
+        summary, summary_path = run_dataset_pipeline(
+            _context_config(context),
+            output,
+            max_packets,
+            allow_unbounded_streaming=all_packets,
+            force_remap=remap,
+        )
         _show_summary(
             "Dataset run complete",
             {
@@ -294,6 +330,100 @@ def dataset_run(
     except Exception:
         log_exception(context.obj["logger"], "running the protocol-first dataset pipeline")
         raise typer.Exit(code=1)
+
+
+@dataset_app.command("extract")
+def dataset_extract(
+    context: typer.Context,
+    output: Annotated[
+        Path | None, typer.Option("--output", "-o", help="Self-contained dataset-run directory.")
+    ] = None,
+    max_packets: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="Cap packets per capture; large values automatically use disk-backed streaming.",
+        ),
+    ] = None,
+    all_packets: Annotated[
+        bool,
+        typer.Option(
+            "--all-packets",
+            help=(
+                "Process every packet with the disk-backed streaming extractor; "
+                "requires disk space."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Extract PCAP features only; run `dataset map` later as a separate one-time step."""
+    try:
+        if all_packets and max_packets is not None:
+            raise typer.BadParameter("Choose either --max-packets or --all-packets, not both.")
+        summary, summary_path = run_dataset_extraction(
+            _context_config(context),
+            output,
+            max_packets,
+            allow_unbounded_streaming=all_packets,
+        )
+        _show_summary(
+            "Dataset feature extraction complete",
+            {
+                "output": summary["output_root"],
+                "benign protocol files": summary["protocol_feature_files"]["benign"],
+                "attack capture files": summary["protocol_feature_files"]["attack"],
+                "mapping": "not started; run `anomaly dataset map <dataset-run>`",
+                "summary": summary_path,
+            },
+        )
+    except Exception as error:
+        log_exception(context.obj["logger"], "extracting protocol-first dataset features")
+        raise typer.Exit(code=1) from error
+
+
+@dataset_app.command("map")
+def dataset_map(
+    context: typer.Context,
+    dataset_run: Annotated[
+        Path,
+        typer.Argument(
+            exists=True, readable=True, help="Dataset-run created by `dataset extract`."
+        ),
+    ],
+    protocol: Annotated[
+        str | None,
+        typer.Option(help="Map one protocol only; omit to map every saved attack capture."),
+    ] = None,
+    remap: Annotated[
+        bool,
+        typer.Option(
+            "--remap",
+            help=(
+                "Ignore a matching saved relation and rebuild the exhaustive "
+                "packet-to-CSV mapping."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Build or reuse packet-to-CSV mappings from saved features without reopening PCAP files."""
+    try:
+        summary, summary_path = run_dataset_mapping(
+            _context_config(context), dataset_run, protocol=protocol, force_remap=remap
+        )
+        _show_summary(
+            "Dataset mapping complete",
+            {
+                "dataset run": summary["output_root"],
+                "mapped captures": summary["mapped_captures"],
+                "accepted mappings": summary["accepted_mappings"],
+                "cache reused": summary["mapping_cache_reused"],
+                "cache created": summary["mapping_cache_created"],
+                "summary": summary_path,
+            },
+        )
+    except Exception as error:
+        log_exception(context.obj["logger"], "mapping saved PCAP feature records")
+        raise typer.Exit(code=1) from error
 
 
 @two_stage_app.command("train")
@@ -311,15 +441,25 @@ def two_stage_train(
     output: Annotated[
         Path | None, typer.Option("--output", "-o", help="Model artifact directory.")
     ] = None,
+    stage_one_only: Annotated[
+        bool,
+        typer.Option(
+            "--stage-one-only",
+            help="Train and evaluate LSTM-AE + Isolation Forest only; skip attack-type RF.",
+        ),
+    ] = False,
 ) -> None:
-    """Train both stages using PCAP features and accepted CSV mapping evidence."""
+    """Train the deployable pipeline, or independently validate Stage 1 first."""
     try:
         benign, attacks = discover_dataset_run_sources(dataset_run, protocol)
         profile_id = Path(profile).stem if profile else "all-features"
         scope = protocol or "all-protocols"
         target = output or dataset_run / "models" / f"{scope}-{profile_id}"
+        config = deepcopy(_context_config(context))
+        if stage_one_only:
+            config.setdefault("stage_two", {})["enabled"] = False
         summary = train_two_stage(
-            benign, attacks, _context_config(context), target, profile, protocol
+            benign, attacks, config, target, profile, protocol
         )
         _show_summary(
             "Two-stage training complete",
@@ -327,7 +467,12 @@ def two_stage_train(
                 "output": target,
                 "stage-one FPR": summary["stage1"]["false_positive_rate"],
                 "stage-one recall": summary["stage1"]["recall"],
-                "stage-two weighted F1": summary["stage2"]["weighted_f1"],
+                "stage-two status": summary["stage2"].get("status", "trained"),
+                "stage-two weighted F1": (
+                    summary["stage2"].get("weighted_f1")
+                    if summary["stage2"].get("status", "trained") == "trained"
+                    else "not trained (see stage2/readiness.json)"
+                ),
                 "ONNX": summary["onnx_exports"],
             },
         )

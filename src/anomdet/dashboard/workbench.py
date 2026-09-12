@@ -18,7 +18,14 @@ import pyarrow.parquet as pq
 import streamlit as st
 from sklearn.cluster import DBSCAN
 from sklearn.manifold import TSNE
-from sklearn.metrics import precision_recall_curve, roc_curve
+from sklearn.metrics import (
+    confusion_matrix,
+    f1_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_curve,
+)
 from sklearn.neighbors import NearestNeighbors
 
 from anomdet.core.io import read_table
@@ -475,24 +482,27 @@ def _training_panel(run: Path, artifact_root: Path, protocol: str | None) -> Non
         return
     st.caption(
         f"نگاشت پذیرفته‌شده برای {protocol}: {accepted}/{total}. "
-        "Stage 1 با benign و Stage 2 فقط با برچسب‌های CSV پذیرفته‌شده آموزش می‌بیند."
+        "Stage 1 با benign آموزش می‌بیند؛ Stage 2 فقط در صورت کافی‌بودن برچسب‌های CSV پذیرفته‌شده فعال می‌شود."
     )
+    if accepted == 0:
+        st.info(
+            "برای این پروتکل هنوز دادهٔ برچسب‌دارِ پذیرفته‌شده وجود ندارد. "
+            "می‌توانید Stage 1 را آموزش دهید؛ Random Forest به‌صورت امن رد می‌شود."
+        )
     with st.form(f"two-stage-training-{run}-{protocol}", border=True):
         acknowledged = st.checkbox(
             "نگاشت‌ها و کیفیت فیچرها را بررسی کرده‌ام و شروع آموزش را تأیید می‌کنم."
         )
         submitted = st.form_submit_button(
-            "شروع آموزش LSTM-AE + Isolation Forest + Random Forest",
+            "شروع آموزش Stage 1 و Stage 2 در صورت آمادگی",
             icon=":material/model_training:",
             type="primary",
-            disabled=is_running or accepted == 0,
+            disabled=is_running,
         )
     if is_running:
         st.warning(
             "یک آموزش در همین نشست در حال اجراست؛ برای جلوگیری از اجرای تکراری، منتظر بمانید."
         )
-    elif accepted == 0:
-        st.warning("هیچ نگاشت پذیرفته‌شده‌ای برای این پروتکل وجود ندارد؛ Stage 2 نباید آموزش ببیند.")
     elif submitted:
         if not acknowledged:
             st.warning("پیش از شروع، تأیید بررسی نگاشت و فیچرها لازم است.")
@@ -514,7 +524,12 @@ def _models_view(run: Path, artifact_root: Path, protocol: str | None) -> None:
     summary = _read_json(selected)
     first, second, timing = st.columns(3)
     first.metric("Stage 1 FPR", f"{summary['stage1']['false_positive_rate']:.2%}")
-    second.metric("Stage 2 F1", f"{summary['stage2']['weighted_f1']:.2%}")
+    stage2 = summary.get("stage2", {})
+    stage2_available = stage2.get("status") == "trained" and stage2.get("weighted_f1") is not None
+    second.metric(
+        "Stage 2 F1",
+        f"{float(stage2['weighted_f1']):.2%}" if stage2_available else "در دسترس نیست",
+    )
     timing.metric("زمان آموزش", f"{summary['training_seconds']:.1f} s")
     model_root = selected.parent
     score_path = model_root / "stage1" / "scores.parquet"
@@ -570,6 +585,12 @@ def _models_view(run: Path, artifact_root: Path, protocol: str | None) -> None:
             evidence = _read(evidence_path)
             st.dataframe(evidence, hide_index=True, width="stretch")
     with tabs[2]:
+        if not stage2_available:
+            st.warning(
+                "Stage 2 / Random Forest برای این مدل آموزش داده نشده است؛ "
+                "نتایج قابل استفاده مربوط به Stage 1 هستند."
+            )
+            st.json(stage2)
         if importance_path.exists():
             importance = _read(importance_path).head(25)
             st.altair_chart(
@@ -777,6 +798,65 @@ def _enable_rtl() -> None:
         }
         .st-key-dashboard-area [data-testid="stSegmentedControl"] label:has(input:checked),
         .st-key-dashboard-area [data-baseweb="button-group"] label:has(input:checked) {
+            background: linear-gradient(112deg, rgba(124,58,237,.92), rgba(74,34,140,.92)) !important;
+            color: #fff !important;
+            box-shadow: 0 0 14px rgba(167,139,250,.45) !important;
+        }
+        /* Streamlit 1.59 renders the segmented control through Base Web's
+           button role rather than its label in some browsers. Keep this
+           fallback deliberately broad: every page-level segmented menu gets
+           the same single rail, while its individual options stay borderless. */
+        [data-testid="stSegmentedControl"] [role="radiogroup"],
+        [data-testid="stSegmentedControl"] [data-baseweb="button-group"] {
+            width: 100% !important;
+            padding: 4px !important;
+            gap: 2px !important;
+            border: 1px solid rgba(192,132,252,.88) !important;
+            border-radius: 16px !important;
+            background: linear-gradient(110deg, rgba(31,20,64,.94), rgba(11,21,48,.98)) !important;
+            box-shadow: 0 0 0 1px rgba(124,58,237,.18), 0 0 18px rgba(124,58,237,.28), inset 0 1px 0 rgba(255,255,255,.06) !important;
+        }
+        [data-testid="stSegmentedControl"] label,
+        [data-testid="stSegmentedControl"] [data-baseweb="button"] {
+            border: 0 !important;
+            outline: 0 !important;
+            background: transparent !important;
+            box-shadow: none !important;
+            border-radius: 12px !important;
+        }
+        [data-testid="stSegmentedControl"] label:hover,
+        [data-testid="stSegmentedControl"] [data-baseweb="button"]:hover {
+            background: linear-gradient(112deg, rgba(139,30,63,.86), rgba(98,20,66,.86)) !important;
+            color: #fff !important;
+            box-shadow: inset 0 0 0 1px rgba(251,113,133,.70), 0 0 15px rgba(225,29,72,.35) !important;
+        }
+        [data-testid="stSegmentedControl"] label:has(input:checked),
+        [data-testid="stSegmentedControl"] [data-baseweb="button"]:has(input:checked) {
+            background: linear-gradient(112deg, rgba(124,58,237,.92), rgba(74,34,140,.92)) !important;
+            color: #fff !important;
+            box-shadow: 0 0 14px rgba(167,139,250,.45) !important;
+        }
+        [data-testid="stSegmentedControl"]:has([role="radio"]) {
+            width: 100% !important;
+            padding: 4px !important;
+            border: 1px solid rgba(192,132,252,.88) !important;
+            border-radius: 16px !important;
+            background: linear-gradient(110deg, rgba(31,20,64,.94), rgba(11,21,48,.98)) !important;
+            box-shadow: 0 0 0 1px rgba(124,58,237,.18), 0 0 18px rgba(124,58,237,.28), inset 0 1px 0 rgba(255,255,255,.06) !important;
+        }
+        [data-testid="stSegmentedControl"] [role="radio"] {
+            border: 0 !important;
+            outline: 0 !important;
+            background: transparent !important;
+            box-shadow: none !important;
+            border-radius: 12px !important;
+        }
+        [data-testid="stSegmentedControl"] [role="radio"]:hover {
+            background: linear-gradient(112deg, rgba(139,30,63,.86), rgba(98,20,66,.86)) !important;
+            color: #fff !important;
+            box-shadow: inset 0 0 0 1px rgba(251,113,133,.70), 0 0 15px rgba(225,29,72,.35) !important;
+        }
+        [data-testid="stSegmentedControl"] [role="radio"][aria-checked="true"] {
             background: linear-gradient(112deg, rgba(124,58,237,.92), rgba(74,34,140,.92)) !important;
             color: #fff !important;
             box-shadow: 0 0 14px rgba(167,139,250,.45) !important;
@@ -1106,6 +1186,560 @@ def _system_model_summaries(run: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     )
 
 
+def _cross_protocol_model_results(run: Path) -> None:
+    """Compare the newest trained model of every protocol without merging their raw feature files."""
+    summary_paths = sorted(run.glob("models/**/training-summary.json"), key=lambda item: item.stat().st_mtime_ns)
+    latest: dict[str, Path] = {}
+    for path in summary_paths:
+        summary = _read_json(path)
+        latest[str(summary.get("protocol", path.parent.name))] = path
+    if not latest:
+        st.info("برای مقایسهٔ بین‌پروتکلی ابتدا حداقل یک مدل دو مرحله‌ای آموزش دهید.")
+        return
+    st.subheader("مقایسهٔ مدل‌ها بین پروتکل‌ها", anchor=False)
+    st.caption(
+        "برای جلوگیری از قاطی‌شدن خروجی‌ها، فقط جدیدترین مدل هر پروتکل در این نما وارد می‌شود؛ "
+        "دادهٔ خام پروتکل‌ها هرگز با هم concat نمی‌شود. اگر فعلاً تنها یک پروتکل آموزش دیده، نمودارها "
+        "همان واقعیت تک‌پروتکل را نشان می‌دهند و با آموزش بقیه خودکار کامل می‌شوند."
+    )
+    metric_rows: list[dict[str, object]] = []
+    score_rows: list[pd.DataFrame] = []
+    pipeline_rows: list[pd.DataFrame] = []
+    importance_rows: list[pd.DataFrame] = []
+    resource_rows: list[pd.DataFrame] = []
+    binary_cells: list[dict[str, object]] = []
+    for protocol, path in latest.items():
+        summary = _read_json(path)
+        stage1, stage2 = summary.get("stage1", {}), summary.get("stage2", {})
+        metric_rows.append(
+            {
+                "پروتکل": protocol,
+                "Precision": stage1.get("precision"),
+                "Recall": stage1.get("recall"),
+                "F1 Stage 1": stage1.get("f1"),
+                "FPR": stage1.get("false_positive_rate"),
+                "ROC-AUC": stage1.get("roc_auc"),
+                "AP": stage1.get("average_precision"),
+                "Weighted F1 Stage 2": stage2.get("weighted_f1"),
+                "زمان آموزش": summary.get("training_seconds"),
+                "رکورد Stage 1": stage1.get("records"),
+                "رکورد Stage 2": stage2.get("test_records"),
+                "گروه": "OT" if protocol in {"modbus", "s7comm"} else "IT",
+                "مدل": path.parent.name,
+            }
+        )
+        score_path = path.parent / "stage1" / "scores.parquet"
+        if score_path.exists():
+            scores = _detector_votes(_read_sample(score_path, 10000))
+            if "stage1_metric_evaluation" in scores:
+                scores = scores[
+                    scores["stage1_metric_evaluation"].fillna(False).astype(bool)
+                ].copy()
+            if not scores.empty:
+                scores["پروتکل"] = protocol
+                scores["گروه"] = "OT" if protocol in {"modbus", "s7comm"} else "IT"
+                score_rows.append(scores)
+                truth, predicted = _model_truth(scores), scores["stage1_anomaly"].fillna(False).astype(bool)
+                tn, fp, fn, tp = confusion_matrix(truth, predicted, labels=[False, True]).ravel()
+                for actual, predicted_name, count in [
+                    ("نرمال", "نرمال", tn),
+                    ("نرمال", "ناهنجاری", fp),
+                    ("حمله", "نرمال", fn),
+                    ("حمله", "ناهنجاری", tp),
+                ]:
+                    binary_cells.append(
+                        {
+                            "پروتکل": protocol,
+                            "واقعی": actual,
+                            "پیش‌بینی": predicted_name,
+                            "تعداد": int(count),
+                        }
+                    )
+        pipeline_path = path.parent / "pipeline" / "end-to-end-predictions.parquet"
+        if pipeline_path.exists():
+            pipeline = _read_sample(pipeline_path, 10000).copy()
+            pipeline["پروتکل"] = protocol
+            pipeline_rows.append(pipeline)
+        importance_path = path.parent / "stage2" / "feature-importance.parquet"
+        if importance_path.exists():
+            importance = _read(importance_path).head(20).copy()
+            importance["پروتکل"] = protocol
+            importance_rows.append(importance)
+        resource_path = path.parent / "reports" / "resource-usage.parquet"
+        if resource_path.exists():
+            resource = _read(resource_path).copy()
+            resource["پروتکل"] = protocol
+            resource_rows.append(resource)
+
+    metrics = pd.DataFrame(metric_rows)
+    scores = pd.concat(score_rows, ignore_index=True, sort=False) if score_rows else pd.DataFrame()
+    pipelines = pd.concat(pipeline_rows, ignore_index=True, sort=False) if pipeline_rows else pd.DataFrame()
+    importance = pd.concat(importance_rows, ignore_index=True, sort=False) if importance_rows else pd.DataFrame()
+    resources = pd.concat(resource_rows, ignore_index=True, sort=False) if resource_rows else pd.DataFrame()
+    metrics_long = metrics.melt(
+        id_vars=["پروتکل"],
+        value_vars=["ROC-AUC", "Precision", "Recall", "F1 Stage 1", "Weighted F1 Stage 2"],
+        var_name="معیار",
+        value_name="مقدار",
+    )
+    left, right = st.columns(2)
+    with left:
+        _plot(
+            px.bar(
+                metrics_long,
+                x="پروتکل",
+                y="مقدار",
+                color="معیار",
+                barmode="group",
+                range_y=[0, 1],
+                color_discrete_sequence=[PLOT_COLORS["violet"], PLOT_COLORS["sky"], PLOT_COLORS["green"], PLOT_COLORS["blue"], PLOT_COLORS["maroon"]],
+            ),
+            "۲۸. پروتکل × معیار؛ کیفیت Stage 1 و Stage 2 کنار هم",
+            430,
+        )
+    with right:
+        heat_metrics = metrics.set_index("پروتکل")[["F1 Stage 1", "Weighted F1 Stage 2"]]
+        _plot(
+            go.Figure(
+                go.Heatmap(
+                    z=heat_metrics.to_numpy(dtype=float),
+                    x=heat_metrics.columns,
+                    y=heat_metrics.index,
+                    colorscale=[[0, PLOT_COLORS["maroon"]], [0.5, PLOT_COLORS["violet"]], [1, PLOT_COLORS["green"]]],
+                    text=np.round(heat_metrics.to_numpy(dtype=float), 3),
+                    texttemplate="%{text}",
+                )
+            ),
+            "۲۹. heatmap پروتکل × مدل/مرحله بر پایهٔ F1",
+            430,
+        )
+    st.dataframe(metrics, hide_index=True, width="stretch")
+    _download(metrics, "دانلود master comparison پروتکل‌ها", "cross-protocol-master-comparison.csv")
+
+    if not scores.empty:
+        roc_figure, pr_figure = go.Figure(), go.Figure()
+        for protocol, scoped in scores.groupby("پروتکل"):
+            truth, score = _model_truth(scoped), _model_scores(scoped)
+            if truth.nunique() < 2:
+                continue
+            fpr, tpr, _ = roc_curve(truth, score)
+            precision, recall, _ = precision_recall_curve(truth, score)
+            roc_figure.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=str(protocol)))
+            pr_figure.add_trace(go.Scatter(x=recall, y=precision, mode="lines", name=str(protocol)))
+        roc_figure.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line={"dash": "dash", "color": PLOT_COLORS["muted"]})
+        left, right = st.columns(2)
+        with left:
+            _plot(roc_figure, "۳۰. ROC overlay به تفکیک پروتکل", 410)
+        with right:
+            _plot(pr_figure, "۳۱. Precision–Recall overlay به تفکیک پروتکل", 410)
+
+        radar = metrics[["پروتکل", "Precision", "Recall", "F1 Stage 1", "ROC-AUC", "FPR"]].copy()
+        radar["FPR معکوس"] = 1 - radar["FPR"].fillna(0)
+        radar = radar.drop(columns="FPR")
+        radar_figure = go.Figure()
+        for _, row in radar.iterrows():
+            theta = radar.columns[1:].tolist()
+            values = pd.to_numeric(row[theta], errors="coerce").fillna(0).tolist()
+            radar_figure.add_trace(go.Scatterpolar(r=values + values[:1], theta=theta + theta[:1], fill="toself", name=str(row["پروتکل"])))
+        _plot(radar_figure, "۳۲. Radar مقایسهٔ کیفیت پروتکل‌ها؛ FPR به‌صورت معکوس", 450)
+
+        scores["تصمیم"] = np.where(scores["stage1_anomaly"].fillna(False), "ناهنجاری", "نرمال")
+        anomaly_rate = scores.groupby("پروتکل", as_index=False)["stage1_anomaly"].mean().rename(columns={"stage1_anomaly": "نرخ ناهنجاری"})
+        left, right = st.columns(2)
+        with left:
+            _plot(
+                px.bar(
+                    anomaly_rate,
+                    x="پروتکل",
+                    y="نرخ ناهنجاری",
+                    color="پروتکل",
+                    range_y=[0, 1],
+                    color_discrete_sequence=[PLOT_COLORS["blue"], PLOT_COLORS["violet"], PLOT_COLORS["maroon"], PLOT_COLORS["sky"]],
+                ),
+                "۳۳. نرخ ناهنجاری تشخیص‌داده‌شده در هر پروتکل",
+                380,
+            )
+        with right:
+            _plot(
+                px.violin(
+                    scores,
+                    x="پروتکل",
+                    y="stage1_normalized_score",
+                    color="پروتکل",
+                    box=True,
+                    points=False,
+                    color_discrete_sequence=[PLOT_COLORS["blue"], PLOT_COLORS["violet"], PLOT_COLORS["maroon"], PLOT_COLORS["sky"]],
+                ),
+                "۴۹. توزیع score Stage 1 به تفکیک پروتکل (Ridge/violin)",
+                380,
+            )
+        timed_scores = _timed_scores(scores)
+        if len(timed_scores) >= 20:
+            timed_scores["_bin"] = timed_scores.groupby("پروتکل").cumcount()
+            timed_scores["_bucket"] = timed_scores.groupby("پروتکل")["_bin"].transform(
+                lambda value: pd.qcut(value, q=min(10, len(value)), duplicates="drop")
+            )
+            normal_timed = timed_scores[~_model_truth(timed_scores)]
+            fpr_timed = normal_timed.groupby(["پروتکل", "_bucket"], observed=True, as_index=False).agg(
+                FPR=("stage1_anomaly", "mean"), زمان=("_time", "min")
+            )
+            if not fpr_timed.empty:
+                _plot(
+                    px.line(
+                        fpr_timed,
+                        x="زمان",
+                        y="FPR",
+                        color="پروتکل",
+                        markers=True,
+                        color_discrete_sequence=[PLOT_COLORS["blue"], PLOT_COLORS["violet"], PLOT_COLORS["maroon"], PLOT_COLORS["sky"]],
+                    ),
+                    "۳۴. روند FPR در زمان به تفکیک پروتکل",
+                    390,
+                )
+            drift_rows: list[dict[str, object]] = []
+            for protocol, scoped in timed_scores.groupby("پروتکل"):
+                half = len(scoped) // 2
+                if half >= 8:
+                    drift_rows.append({"پروتکل": protocol, "PSI score": _population_stability_index(_model_scores(scoped.iloc[:half]).to_numpy(), _model_scores(scoped.iloc[half:]).to_numpy())})
+            drift = pd.DataFrame(drift_rows).dropna()
+            if not drift.empty:
+                _plot(
+                    px.bar(
+                        drift,
+                        x="پروتکل",
+                        y="PSI score",
+                        color="PSI score",
+                        color_continuous_scale=[PLOT_COLORS["sky"], PLOT_COLORS["maroon"]],
+                    ),
+                    "۴۷. جابه‌جایی توزیع score (PSI) بین نیمهٔ اول و دوم آزمون",
+                    380,
+                )
+                st.dataframe(drift, hide_index=True, width="stretch")
+
+        left, right = st.columns(2)
+        with left:
+            _plot(
+                px.box(
+                    scores,
+                    x="پروتکل",
+                    y="lstm_reconstruction_score",
+                    color="پروتکل",
+                    points="outliers",
+                    color_discrete_sequence=[PLOT_COLORS["blue"], PLOT_COLORS["violet"], PLOT_COLORS["maroon"], PLOT_COLORS["sky"]],
+                ),
+                "۳۶. خطای بازسازی LSTM-AE در همهٔ پروتکل‌ها",
+                390,
+            )
+        with right:
+            scores["کلاس واقعی"] = np.where(_model_truth(scores), "حمله", "نرمال")
+            _plot(
+                px.scatter(
+                    scores,
+                    x="lstm_reconstruction_score",
+                    y="isolation_forest_score",
+                    color="پروتکل",
+                    symbol="کلاس واقعی",
+                    opacity=0.58,
+                    render_mode="svg",
+                    color_discrete_sequence=[PLOT_COLORS["blue"], PLOT_COLORS["violet"], PLOT_COLORS["maroon"], PLOT_COLORS["sky"]],
+                ),
+                "۳۷. فضای مشترک detectorها؛ رنگ=پروتکل، شکل=نرمال/حمله",
+                390,
+            )
+        health_timed = _timed_scores(scores)
+        if len(health_timed) >= 12:
+            health_timed["_bin"] = pd.qcut(
+                np.arange(len(health_timed)), q=min(20, len(health_timed)), duplicates="drop"
+            )
+            health = health_timed.groupby("_bin", observed=True, as_index=False).agg(
+                زمان=("_time", "min"),
+                score_میانگین=("stage1_normalized_score", "mean"),
+                alert_مرزی=("stage1_normalized_score", lambda values: values.between(0.8, 1.0).mean()),
+            )
+            health["امتیاز سلامت"] = 1 / (1 + health["score_میانگین"].clip(lower=0))
+            left, right = st.columns(2)
+            with left:
+                _plot(
+                    px.line(
+                        health,
+                        x="زمان",
+                        y="امتیاز سلامت",
+                        markers=True,
+                        color_discrete_sequence=[PLOT_COLORS["green"]],
+                    ),
+                    "۱۶. امتیاز سلامت ترکیبی سامانه؛ معکوس شدت میانگین Stage 1",
+                    360,
+                )
+            with right:
+                _plot(
+                    px.area(
+                        health,
+                        x="زمان",
+                        y="alert_مرزی",
+                        color_discrete_sequence=[PLOT_COLORS["maroon"]],
+                    ),
+                    "۲۲. شاخص خستگی alert؛ سهم scoreهای نزدیک threshold",
+                    360,
+                )
+
+    if not importance.empty:
+        overlap = importance.pivot_table(index="feature", columns="پروتکل", values="importance", aggfunc="max", fill_value=0)
+        selected_features = overlap.max(axis=1).nlargest(25).index
+        overlap = overlap.loc[selected_features]
+        left, right = st.columns(2)
+        with left:
+            _plot(
+                go.Figure(
+                    go.Heatmap(
+                        z=overlap.to_numpy(),
+                        x=overlap.columns,
+                        y=overlap.index,
+                        colorscale=[[0, PLOT_COLORS["navy"]], [0.5, PLOT_COLORS["violet"]], [1, PLOT_COLORS["red"]]],
+                        text=np.round(overlap.to_numpy(), 3),
+                        texttemplate="%{text}",
+                    )
+                ),
+                "۳۵. هم‌پوشانی اهمیت فیچرها در پروتکل‌ها",
+                max(430, len(overlap) * 21),
+            )
+        with right:
+            tree = importance.sort_values("importance", ascending=False).head(50)
+            _plot(
+                px.treemap(
+                    tree,
+                    path=["پروتکل", "feature"],
+                    values="importance",
+                    color="importance",
+                    color_continuous_scale=[PLOT_COLORS["sky"], PLOT_COLORS["maroon"]],
+                ),
+                "۳۸. Treemap فیچرهای غالب به تفکیک پروتکل",
+                500,
+            )
+        global_importance = importance.groupby("feature", as_index=False)["importance"].mean().rename(columns={"importance": "اهمیت کلی"})
+        divergence = importance.merge(global_importance, on="feature")
+        divergence["اختلاف از اهمیت کلی"] = (divergence["importance"] - divergence["اهمیت کلی"]).abs()
+        _plot(
+            px.bar(
+                divergence.nlargest(25, "اختلاف از اهمیت کلی"),
+                x="feature",
+                y="اختلاف از اهمیت کلی",
+                color="پروتکل",
+                barmode="group",
+                color_discrete_sequence=[PLOT_COLORS["blue"], PLOT_COLORS["violet"], PLOT_COLORS["maroon"], PLOT_COLORS["sky"]],
+            ),
+            "۳۹. واگرایی اهمیت کلی و اهمیت اختصاصی پروتکل",
+            430,
+        )
+        overlap_table = (
+            importance.assign(رتبه=importance.groupby("پروتکل")["importance"].rank(method="first", ascending=False))
+            .query("رتبه <= 10")
+            .groupby("feature", as_index=False)
+            .agg(تعداد_پروتکل=("پروتکل", "nunique"), میانگین_رتبه=("رتبه", "mean"))
+            .sort_values(["تعداد_پروتکل", "میانگین_رتبه"], ascending=[False, True])
+        )
+        st.dataframe(overlap_table, hide_index=True, width="stretch")
+
+    if not pipelines.empty:
+        truth = _model_truth(pipelines)
+        pipeline_composition = pipelines.assign(کلاس=np.where(truth, "حمله", "نرمال")).groupby(["پروتکل", "کلاس"], as_index=False).size()
+        left, right = st.columns(2)
+        with left:
+            _plot(
+                px.bar(
+                    pipeline_composition,
+                    x="پروتکل",
+                    y="size",
+                    color="کلاس",
+                    barmode="stack",
+                    color_discrete_map={"نرمال": PLOT_COLORS["blue"], "حمله": PLOT_COLORS["maroon"]},
+                ),
+                "۴۰. ترکیب دیتاست تست: نرمال/حمله در هر پروتکل",
+                400,
+            )
+        with right:
+            anomalies = pipelines[pipelines["stage1_anomaly"].fillna(False)]
+            if not anomalies.empty:
+                share = anomalies.groupby("پروتکل", as_index=False).size()
+                _plot(
+                    px.pie(
+                        share,
+                        names="پروتکل",
+                        values="size",
+                        hole=0.55,
+                        color_discrete_sequence=[PLOT_COLORS["blue"], PLOT_COLORS["violet"], PLOT_COLORS["maroon"], PLOT_COLORS["sky"]],
+                    ),
+                    "۴۱. سهم پروتکل‌ها از alertهای شناسایی‌شده",
+                    400,
+                )
+        attack_flow = pipelines[truth & pipelines["label"].notna()].groupby(["پروتکل", "label"], as_index=False).size()
+        if not attack_flow.empty:
+            sources = attack_flow["پروتکل"].tolist()
+            targets = attack_flow["label"].astype(str).tolist()
+            names = list(dict.fromkeys([*sources, *targets]))
+            node = {name: position for position, name in enumerate(names)}
+            _plot(
+                go.Figure(
+                    go.Sankey(
+                        node={"label": names, "color": PLOT_COLORS["violet"]},
+                        link={
+                            "source": [node[value] for value in sources],
+                            "target": [node[value] for value in targets],
+                            "value": attack_flow["size"].tolist(),
+                            "color": "rgba(124,58,237,.35)",
+                        },
+                    )
+                ),
+                "۴۲. جریان پروتکل → نوع حمله (فقط برچسب‌های نگاشت‌شده)",
+                500,
+            )
+        gates = pipelines.assign(
+            Stage1=np.where(pipelines["stage1_anomaly"].fillna(False), "عبور از Stage 1", "متوقف در Stage 1"),
+            صحیح_نهایی=np.where(
+                _model_truth(pipelines)
+                & pipelines["stage1_anomaly"].fillna(False)
+                & pipelines["predicted_attack_type"].fillna("normal").astype(str).eq(pipelines["label"].fillna("unknown").astype(str)),
+                "نوع صحیح",
+                "سایر",
+            ),
+        ).groupby(["پروتکل", "Stage1", "صحیح_نهایی"], as_index=False).size()
+        _plot(
+            px.bar(
+                gates,
+                x="پروتکل",
+                y="size",
+                color="صحیح_نهایی",
+                facet_col="Stage1",
+                barmode="stack",
+                color_discrete_map={"نوع صحیح": PLOT_COLORS["green"], "سایر": PLOT_COLORS["maroon"]},
+            ),
+            "۴۴. Funnel عملیاتی هر پروتکل: گیت Stage 1 → نوع صحیح",
+            450,
+        )
+        composition = pipeline_composition.pivot_table(index="پروتکل", columns="کلاس", values="size", fill_value=0).reset_index()
+        composition["نسبت حمله به نرمال"] = composition.get("حمله", 0) / composition.get("نرمال", 0).replace(0, np.nan)
+        st.dataframe(composition, hide_index=True, width="stretch")
+
+    if not metrics.empty:
+        it_ot = metrics.groupby("گروه", as_index=False)[["Precision", "Recall", "F1 Stage 1", "Weighted F1 Stage 2", "FPR"]].mean(numeric_only=True)
+        _plot(
+            px.bar(
+                it_ot.melt(id_vars="گروه", var_name="معیار", value_name="مقدار"),
+                x="گروه",
+                y="مقدار",
+                color="معیار",
+                barmode="group",
+                range_y=[0, 1],
+                color_discrete_sequence=[PLOT_COLORS["sky"], PLOT_COLORS["green"], PLOT_COLORS["violet"], PLOT_COLORS["maroon"], PLOT_COLORS["red"]],
+            ),
+            "۴۳. مقایسهٔ IT و OT روی معیارهای کلیدی",
+            400,
+        )
+        risk = metrics.merge(
+            scores.groupby("پروتکل", as_index=False).agg(نرخ_ناهنجاری=("stage1_anomaly", "mean"), شدت_میانگین=("stage1_normalized_score", "mean")) if not scores.empty else pd.DataFrame(columns=["پروتکل", "نرخ_ناهنجاری", "شدت_میانگین"]),
+            on="پروتکل", how="left"
+        )
+        _plot(
+            px.scatter(
+                risk,
+                x="رکورد Stage 1",
+                y="نرخ_ناهنجاری",
+                size="شدت_میانگین",
+                color="گروه",
+                hover_name="پروتکل",
+                color_discrete_map={"IT": PLOT_COLORS["sky"], "OT": PLOT_COLORS["maroon"]},
+            ),
+            "۵۰. نمای ریسک عملیاتی پروتکل؛ حجم × نرخ alert × شدت",
+            420,
+        )
+        recommendation = metrics.copy()
+        recommendation["مدل پیشنهادی"] = np.where(
+            recommendation["F1 Stage 1"].fillna(0) >= recommendation["Weighted F1 Stage 2"].fillna(0),
+            "بازبینی گیت Stage 1 اولویت دارد",
+            "Stage 2 برای نوع‌بندی مناسب‌تر است",
+        )
+        recommendation["دلیل"] = np.where(
+            recommendation["FPR"].fillna(1) > 0.05,
+            "FPR بالاست؛ threshold/feature profile را بازبینی کنید",
+            "FPR در بودجهٔ فعلی است؛ Recall و نوع‌بندی را بهبود دهید",
+        )
+        recommendation_matrix = recommendation.set_index("پروتکل")[
+            ["F1 Stage 1", "Weighted F1 Stage 2", "FPR"]
+        ].copy()
+        recommendation_matrix["FPR معکوس"] = 1 - recommendation_matrix.pop("FPR").fillna(1)
+        _plot(
+            go.Figure(
+                go.Heatmap(
+                    z=recommendation_matrix.to_numpy(dtype=float),
+                    x=recommendation_matrix.columns,
+                    y=recommendation_matrix.index,
+                    colorscale=[[0, PLOT_COLORS["maroon"]], [0.5, PLOT_COLORS["violet"]], [1, PLOT_COLORS["green"]]],
+                    text=np.round(recommendation_matrix.to_numpy(dtype=float), 3),
+                    texttemplate="%{text}",
+                )
+            ),
+            "۴۸. ماتریس توصیهٔ مدل؛ F1 و FPR معکوس برای هر پروتکل",
+            390,
+        )
+        st.dataframe(recommendation[["پروتکل", "مدل پیشنهادی", "دلیل", "F1 Stage 1", "Weighted F1 Stage 2", "FPR"]], hide_index=True, width="stretch")
+
+    if not resources.empty:
+        _plot(
+            px.bar(
+                resources,
+                x="پروتکل",
+                y="process_rss_mb",
+                color="point",
+                barmode="group",
+                color_discrete_map={"before_training": PLOT_COLORS["sky"], "after_training": PLOT_COLORS["maroon"]},
+            ),
+            "۴۵. زمان/منبع آموزش به تفکیک پروتکل؛ RAM فرایند",
+            400,
+        )
+        st.dataframe(resources, hide_index=True, width="stretch")
+    else:
+        _missing_visual(
+            "۴۵–۴۶. منبع و توان عملیاتی بین پروتکل‌ها",
+            "reports/resource-usage.parquet و pipeline/inference-latency.parquet",
+            "زمان آموزش در summary موجود است؛ latency/throughput inference هنوز benchmark نشده است.",
+        )
+
+    if not scores.empty:
+        agreement = _detector_votes(scores).groupby(["پروتکل", "وضعیت توافق"], as_index=False).size()
+        _plot(
+            px.bar(
+                agreement,
+                x="پروتکل",
+                y="size",
+                color="وضعیت توافق",
+                barmode="stack",
+                color_discrete_map={
+                    "هر دو": PLOT_COLORS["violet"],
+                    "فقط LSTM": PLOT_COLORS["maroon"],
+                    "فقط IF": PLOT_COLORS["sky"],
+                    "هیچ‌کدام": PLOT_COLORS["blue"],
+                },
+            ),
+            "۵۱. توافق ensemble بین پروتکل‌ها؛ کاندید بازبینی threshold",
+            400,
+        )
+    if binary_cells:
+        cells = pd.DataFrame(binary_cells)
+        _plot(
+            px.density_heatmap(
+                cells,
+                x="پیش‌بینی",
+                y="واقعی",
+                z="تعداد",
+                facet_col="پروتکل",
+                histfunc="sum",
+                color_continuous_scale=[[0, PLOT_COLORS["navy"]], [1, PLOT_COLORS["violet"]]],
+            ),
+            "۵۲. Small multiples ماتریس confusion Stage 1 در همهٔ پروتکل‌ها",
+            440,
+        )
+        st.dataframe(cells, hide_index=True, width="stretch")
+
+
 def _system_observatory(run: Path, catalog: pd.DataFrame) -> None:
     """Render the all-protocol control room from persisted, portable artifacts.
 
@@ -1121,6 +1755,17 @@ def _system_observatory(run: Path, catalog: pd.DataFrame) -> None:
         "یک پروتکل، همان پروتکل را از سایدبار انتخاب و بخش‌های دیگر را باز کنید. نمودارهای زمانی "
         "UTC هستند و دادهٔ packet-level روی نمونهٔ یکنواخت و محدود برای پاسخ‌گویی dashboard رسم می‌شود."
     )
+    system_view = st.segmented_control(
+        "نمای تابلوی کل سامانه",
+        ["پایش داده و سلامت", "مقایسهٔ مدل‌ها و AI"],
+        default="پایش داده و سلامت",
+        key=f"system-observatory-view-{run}",
+        width="stretch",
+    )
+    if system_view == "مقایسهٔ مدل‌ها و AI":
+        _cross_protocol_model_results(run)
+        _resource_monitor()
+        return
     scoped = catalog.copy()
     scoped["protocol"] = scoped["protocol"].fillna("کلی")
     scoped["rows"] = pd.to_numeric(scoped["rows"], errors="coerce").fillna(0)
@@ -2252,8 +2897,15 @@ def _features_enhanced(run: Path, catalog: pd.DataFrame, protocol: str | None) -
 
 
 def _start_dataset_job(
-    artifact_root: Path, run_name: str, maximum_packets: int | None
+    artifact_root: Path,
+    run_name: str,
+    maximum_packets: int | None,
+    *,
+    all_packets: bool = False,
 ) -> dict[str, Any]:
+    """Launch the same bounded/streaming dataset command exposed by the CLI."""
+    if all_packets and maximum_packets is not None:
+        raise ValueError("A dashboard run cannot set both a packet cap and all-packets mode.")
     target = artifact_root / "runs" / run_name
     target.mkdir(parents=True, exist_ok=False)
     log_path = target / "dashboard-dataset-run.log"
@@ -2268,6 +2920,8 @@ def _start_dataset_job(
     ]
     if maximum_packets is not None:
         command.extend(["--max-packets", str(maximum_packets)])
+    elif all_packets:
+        command.append("--all-packets")
     with log_path.open("w", encoding="utf-8") as output:
         process = subprocess.Popen(
             command, cwd=_project_root(), stdout=output, stderr=subprocess.STDOUT, text=True
@@ -2345,7 +2999,16 @@ def _dataset_build_panel(artifact_root: Path) -> None:
             value=200,
             step=50,
             disabled=mode != "آزمون محدود",
+            help=(
+                "فقط در آزمون محدود اعمال می‌شود. استخراج کامل همهٔ packetها را "
+                "به‌صورت جریانی و دیسک‌محور پردازش می‌کند."
+            ),
         )
+        if mode == "استخراج کامل":
+            st.caption(
+                "حالت کامل معادل `anomaly dataset run --all-packets` است: "
+                "فایل‌های Parquet جدا و chunk‌شده می‌سازد و به فضای آزاد دیسک نیاز دارد."
+            )
         confirmed = st.checkbox(
             "می‌دانم اجرای کامل ممکن است زمان‌بر باشد و یک پوشهٔ خروجی جدید می‌سازد."
         )
@@ -2370,7 +3033,10 @@ def _dataset_build_panel(artifact_root: Path) -> None:
             st.warning("پیش از شروع، تأیید ساخت اجرای جدید لازم است.")
         else:
             job = _start_dataset_job(
-                artifact_root, run_name.strip(), int(maximum) if mode == "آزمون محدود" else None
+                artifact_root,
+                run_name.strip(),
+                int(maximum) if mode == "آزمون محدود" else None,
+                all_packets=mode == "استخراج کامل",
             )
             st.success(f"اجرای داده در پس‌زمینه آغاز شد. log: {job['log_path']}")
     _dataset_job_status()
@@ -2554,6 +3220,7 @@ def _profiles_enhanced(
 def _model_metrics_table(summary: dict[str, Any]) -> pd.DataFrame:
     stage1 = summary.get("stage1", {})
     stage2 = summary.get("stage2", {})
+    stage2_trained = stage2.get("status") == "trained"
     return pd.DataFrame(
         [
             {
@@ -2566,7 +3233,7 @@ def _model_metrics_table(summary: dict[str, Any]) -> pd.DataFrame:
                 "FPR": stage1.get("false_positive_rate"),
             },
             {
-                "مدل": "Stage 2: Random Forest",
+                "مدل": "Stage 2: Random Forest" if stage2_trained else "Stage 2: اجرا نشده",
                 "رکورد ارزیابی": stage2.get("test_records"),
                 "دقت": stage2.get("test_accuracy"),
                 "Precision": None,
@@ -2733,6 +3400,1526 @@ def _population_stability_index(reference: np.ndarray, current: np.ndarray) -> f
     expected = np.clip(expected, 1e-6, None)
     actual = np.clip(actual, 1e-6, None)
     return float(np.sum((actual - expected) * np.log(actual / expected)))
+
+
+def _model_truth(frame: pd.DataFrame) -> pd.Series:
+    """Return the mapped binary ground truth without silently treating missing labels as attacks."""
+    return frame.get("true_is_attack", pd.Series(False, index=frame.index)).fillna(False).astype(bool)
+
+
+def _model_scores(frame: pd.DataFrame) -> pd.Series:
+    """Return a finite Stage 1 ensemble score for chart calculations."""
+    return pd.to_numeric(
+        frame.get("stage1_normalized_score", pd.Series(0.0, index=frame.index)), errors="coerce"
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def _detector_votes(frame: pd.DataFrame) -> pd.DataFrame:
+    """Make the LSTM/IF agreement explicit so it can be audited in every view."""
+    output = frame.copy()
+    lstm = pd.to_numeric(output.get("lstm_reconstruction_score"), errors="coerce")
+    lstm_threshold = pd.to_numeric(output.get("lstm_threshold"), errors="coerce")
+    forest = pd.to_numeric(output.get("isolation_forest_score"), errors="coerce")
+    forest_threshold = pd.to_numeric(output.get("isolation_forest_threshold"), errors="coerce")
+    output["رأی LSTM"] = (lstm >= lstm_threshold).fillna(False)
+    output["رأی IF"] = (forest >= forest_threshold).fillna(False)
+    output["تعداد رأی"] = output["رأی LSTM"].astype(int) + output["رأی IF"].astype(int)
+    output["وضعیت توافق"] = np.select(
+        [
+            output["رأی LSTM"] & output["رأی IF"],
+            output["رأی LSTM"],
+            output["رأی IF"],
+        ],
+        ["هر دو", "فقط LSTM", "فقط IF"],
+        default="هیچ‌کدام",
+    )
+    return output
+
+
+def _threshold_table(truth: pd.Series, scores: pd.Series, points: int = 41) -> pd.DataFrame:
+    """Evaluate transparent threshold trade-offs from already persisted Stage 1 scores."""
+    finite = scores.replace([np.inf, -np.inf], np.nan).dropna()
+    if finite.empty or truth.nunique(dropna=True) < 2:
+        return pd.DataFrame()
+    lower, upper = np.quantile(finite, [0.01, 0.99])
+    lower, upper = min(float(lower), 1.0), max(float(upper), 1.0)
+    thresholds = np.linspace(lower, upper, points)
+    y_true = truth.astype(bool).to_numpy()
+    values: list[dict[str, float]] = []
+    for threshold in thresholds:
+        predicted = scores.ge(threshold).to_numpy()
+        tn, fp, fn, tp = confusion_matrix(y_true, predicted, labels=[False, True]).ravel()
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        values.append(
+            {
+                "threshold": float(threshold),
+                "Precision": precision,
+                "Recall": recall,
+                "F1": 2 * precision * recall / max(precision + recall, 1e-12),
+                "FPR": fp / max(fp + tn, 1),
+                "TP": float(tp),
+                "FP": float(fp),
+                "TN": float(tn),
+                "FN": float(fn),
+            }
+        )
+    return pd.DataFrame(values)
+
+
+def _score_calibration_table(truth: pd.Series, scores: pd.Series, bins: int = 10) -> pd.DataFrame:
+    """Calculate empirical attack rate by score bin; score is not mislabelled as probability."""
+    frame = pd.DataFrame({"truth": truth.astype(float), "score": scores}).dropna()
+    if len(frame) < bins or frame["truth"].nunique() < 2:
+        return pd.DataFrame()
+    try:
+        frame["bin"] = pd.qcut(frame["score"], q=min(bins, frame["score"].nunique()), duplicates="drop")
+    except ValueError:
+        return pd.DataFrame()
+    return (
+        frame.groupby("bin", observed=True, as_index=False)
+        .agg(
+            میانگین_score=("score", "mean"),
+            نرخ_واقعی_حمله=("truth", "mean"),
+            رکورد=("truth", "size"),
+        )
+        .sort_values("میانگین_score")
+    )
+
+
+def _timed_scores(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize the optional packet timestamp once for all temporal diagnostics."""
+    if "timestamp" not in frame:
+        return pd.DataFrame()
+    timed = frame.copy()
+    timed["_time"] = pd.to_datetime(timed["timestamp"], errors="coerce", utc=True)
+    timed = timed.dropna(subset=["_time"]).sort_values("_time")
+    return timed
+
+
+def _missing_visual(title: str, expected: str, why: str) -> None:
+    """Keep the chart catalogue honest when an optional diagnostic has not been run."""
+    with st.container(border=True):
+        st.markdown(f"##### {title}")
+        st.caption(why)
+        st.info(f"برای این نمودار فایل `{expected}` را با اجرای ارزیابی کامل تولید کنید.")
+
+
+def _stage2_class_report(matrix: pd.DataFrame) -> pd.DataFrame:
+    """Derive per-attack precision/recall/F1 from the persisted numeric matrix."""
+    if matrix.empty or "true_attack_type" not in matrix:
+        return pd.DataFrame()
+    indexed = matrix.set_index("true_attack_type")
+    labels = [label for label in indexed.index if label in indexed.columns]
+    if not labels:
+        return pd.DataFrame()
+    values = indexed.loc[labels, labels].to_numpy(dtype=float)
+    report: list[dict[str, float | str]] = []
+    for position, label in enumerate(labels):
+        tp = values[position, position]
+        support = values[position, :].sum()
+        predicted = values[:, position].sum()
+        precision = tp / max(predicted, 1)
+        recall = tp / max(support, 1)
+        report.append(
+            {
+                "نوع حمله": str(label),
+                "Precision": precision,
+                "Recall": recall,
+                "F1": 2 * precision * recall / max(precision + recall, 1e-12),
+                "Support": support,
+                "Accuracy هر کلاس": recall,
+            }
+        )
+    return pd.DataFrame(report).sort_values("Support", ascending=False)
+
+
+def _stage_one_evaluation(model_root: Path, summary: dict[str, Any]) -> None:
+    """Render the complete auditable Stage 1 evaluation set for one protocol model."""
+    score_path = model_root / "stage1" / "scores.parquet"
+    history_path = model_root / "stage1" / "lstm-training-history.parquet"
+    if not score_path.exists():
+        _notice_missing("ارزیابی Stage 1", "stage1/scores.parquet")
+        return
+    all_scores = _detector_votes(_read_sample(score_path, 15000))
+    if all_scores.empty:
+        st.info("فایل امتیاز Stage 1 خالی است.")
+        return
+    # New model artifacts mark the small benign subset used solely for
+    # threshold calibration.  Exclude it from all evaluation charts so FPR is
+    # calculated on traffic unseen by fitting and calibration.  Older runs do
+    # not carry the column and remain viewable with their original scope.
+    if "stage1_metric_evaluation" in all_scores:
+        evaluated = all_scores["stage1_metric_evaluation"].fillna(False).astype(bool)
+        excluded_calibration = int((~evaluated).sum())
+        scores = all_scores[evaluated].copy()
+    else:
+        excluded_calibration = 0
+        scores = all_scores.copy()
+    if scores.empty:
+        st.info("پس از حذف رکوردهای calibration، رکورد ارزیابی Stage 1 باقی نماند.")
+        return
+    stage1 = summary.get("stage1", {})
+    truth = _model_truth(scores)
+    ensemble_score = _model_scores(scores)
+    predicted = scores.get("stage1_anomaly", pd.Series(False, index=scores.index)).fillna(False).astype(bool)
+    scores["کلاس واقعی"] = np.where(truth, "حمله", "نرمال")
+    scores["تصمیم Stage 1"] = np.where(predicted, "ناهنجاری", "نرمال")
+
+    st.subheader("ارزیابی Stage 1 — تشخیص حمله یا نرمال", anchor=False)
+    st.caption(
+        "تمام نرخ‌ها از بخش evaluationِ `stage1/scores.parquet` و برچسب‌های نگاشت‌شده ساخته می‌شوند؛ "
+        "بنابراین FPR و Recall به‌صورت هم‌زمان دیده می‌شوند."
+    )
+    if excluded_calibration:
+        st.caption(
+            f"{excluded_calibration:,} رکورد benign که فقط برای calibration آستانه استفاده شده‌اند "
+            "از این معیارها کنار گذاشته شده‌اند."
+        )
+    tn, fp, fn, tp = confusion_matrix(truth, predicted, labels=[False, True]).ravel()
+    overview = pd.DataFrame(
+        [
+            {
+                "TP": tp,
+                "FP": fp,
+                "TN": tn,
+                "FN": fn,
+                "Precision": precision_score(truth, predicted, zero_division=0),
+                "Recall": recall_score(truth, predicted, zero_division=0),
+                "F1": f1_score(truth, predicted, zero_division=0),
+                "FPR": fp / max(fp + tn, 1),
+                "Specificity": tn / max(tn + fp, 1),
+                "ROC-AUC": stage1.get("roc_auc"),
+                "Average precision": stage1.get("average_precision"),
+            }
+        ]
+    )
+    st.dataframe(
+        overview,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            item: st.column_config.NumberColumn(format="%.2f%%")
+            for item in [
+                "Precision",
+                "Recall",
+                "F1",
+                "FPR",
+                "Specificity",
+                "ROC-AUC",
+                "Average precision",
+            ]
+        },
+    )
+    _download(overview, "دانلود خلاصهٔ ارزیابی Stage 1", "stage1-evaluation-summary.csv")
+
+    left, right = st.columns(2)
+    with left:
+        _plot(
+            go.Figure(
+                go.Heatmap(
+                    z=[[tn, fp], [fn, tp]],
+                    x=["پیش‌بینی نرمال", "پیش‌بینی ناهنجاری"],
+                    y=["واقعی نرمال", "واقعی حمله"],
+                    colorscale=[[0, PLOT_COLORS["navy"]], [1, PLOT_COLORS["violet"]]],
+                    text=[[tn, fp], [fn, tp]],
+                    texttemplate="%{text}",
+                )
+            ),
+            "۱. Confusion matrix مرحلهٔ اول",
+            390,
+        )
+    with right:
+        _plot(
+            px.histogram(
+                scores,
+                x="stage1_normalized_score",
+                color="کلاس واقعی",
+                facet_row="تصمیم Stage 1",
+                barmode="overlay",
+                nbins=44,
+                color_discrete_map={"نرمال": PLOT_COLORS["blue"], "حمله": PLOT_COLORS["red"]},
+            ).add_vline(x=1, line_dash="dash", line_color=PLOT_COLORS["text"]),
+            "۶. توزیع score آزمون؛ تفکیک نرمال/حمله و تصمیم مدل",
+            390,
+        )
+
+    if truth.nunique() > 1:
+        fpr, tpr, _ = roc_curve(truth, ensemble_score)
+        precision, recall, _ = precision_recall_curve(truth, ensemble_score)
+        threshold_scores = _threshold_table(truth, ensemble_score)
+        left, middle, right = st.columns(3)
+        with left:
+            _plot(
+                px.line(
+                    pd.DataFrame({"FPR": fpr, "TPR / Recall": tpr}),
+                    x="FPR",
+                    y="TPR / Recall",
+                    markers=True,
+                ).add_shape(
+                    type="line",
+                    x0=0,
+                    y0=0,
+                    x1=1,
+                    y1=1,
+                    line={"dash": "dash", "color": PLOT_COLORS["muted"]},
+                ),
+                f"۲. ROC Stage 1؛ AUC = {float(stage1.get('roc_auc', 0)):.3f}",
+                370,
+            )
+        with middle:
+            _plot(
+                px.line(
+                    pd.DataFrame({"Recall": recall, "Precision": precision}),
+                    x="Recall",
+                    y="Precision",
+                    markers=True,
+                ),
+                "۳. Precision–Recall Stage 1؛ مناسب دادهٔ نامتوازن",
+                370,
+            )
+        with right:
+            if not threshold_scores.empty:
+                sweep = threshold_scores.melt(
+                    id_vars="threshold",
+                    value_vars=["Precision", "Recall", "F1", "FPR"],
+                    var_name="شاخص",
+                    value_name="مقدار",
+                )
+                _plot(
+                    px.line(
+                        sweep,
+                        x="threshold",
+                        y="مقدار",
+                        color="شاخص",
+                        color_discrete_map={
+                            "Precision": PLOT_COLORS["sky"],
+                            "Recall": PLOT_COLORS["green"],
+                            "F1": PLOT_COLORS["violet"],
+                            "FPR": PLOT_COLORS["red"],
+                        },
+                    ).add_vline(x=1, line_dash="dash", line_color=PLOT_COLORS["text"]),
+                    "۴. پیمایش threshold؛ FPR کنار Precision/Recall/F1",
+                    370,
+                )
+        if not threshold_scores.empty:
+            _plot(
+                px.line(
+                    threshold_scores,
+                    x="FPR",
+                    y="Recall",
+                    color_discrete_sequence=[PLOT_COLORS["violet"]],
+                    markers=True,
+                    hover_data=["threshold", "Precision", "F1"],
+                ).add_vline(
+                    x=float(stage1.get("thresholds", {}).get("lstm", {}).get("target_false_positive_rate", 0)),
+                    line_dash="dash",
+                    line_color=PLOT_COLORS["red"],
+                ),
+                "۵. مبادلهٔ مستقیم FPR در برابر Recall؛ خط = بودجهٔ FPR هدف",
+                390,
+            )
+
+    left, right = st.columns(2)
+    with left:
+        _plot(
+            px.histogram(
+                scores,
+                x="lstm_reconstruction_score",
+                color="کلاس واقعی",
+                barmode="overlay",
+                nbins=48,
+                color_discrete_map={"نرمال": PLOT_COLORS["blue"], "حمله": PLOT_COLORS["red"]},
+            ).add_vline(
+                x=float(scores["lstm_threshold"].dropna().iloc[0])
+                if scores["lstm_threshold"].notna().any()
+                else 0,
+                line_dash="dash",
+                line_color=PLOT_COLORS["text"],
+            ),
+            "۷. خطای بازسازی LSTM-AE؛ نرمال در برابر حمله",
+            390,
+        )
+    with right:
+        _plot(
+            px.histogram(
+                scores,
+                x="isolation_forest_score",
+                color="کلاس واقعی",
+                barmode="overlay",
+                nbins=48,
+                color_discrete_map={"نرمال": PLOT_COLORS["blue"], "حمله": PLOT_COLORS["maroon"]},
+            ).add_vline(
+                x=float(scores["isolation_forest_threshold"].dropna().iloc[0])
+                if scores["isolation_forest_threshold"].notna().any()
+                else 0,
+                line_dash="dash",
+                line_color=PLOT_COLORS["text"],
+            ),
+            "۸. امتیاز Isolation Forest؛ نرمال در برابر حمله",
+            390,
+        )
+
+    if history_path.exists():
+        history = _read(history_path)
+        if not history.empty and {"epoch", "train_loss", "validation_loss"}.issubset(history):
+            history_chart = history.melt(
+                id_vars="epoch",
+                value_vars=["train_loss", "validation_loss"],
+                var_name="مجموعه",
+                value_name="loss",
+            )
+            _plot(
+                px.line(
+                    history_chart,
+                    x="epoch",
+                    y="loss",
+                    color="مجموعه",
+                    markers=True,
+                    color_discrete_map={
+                        "train_loss": PLOT_COLORS["sky"],
+                        "validation_loss": PLOT_COLORS["maroon"],
+                    },
+                ),
+                "۹. منحنی یادگیری LSTM-AE؛ آموزش در برابر validation",
+                390,
+            )
+    learning_curve_path = model_root / "stage1" / "learning-curve.parquet"
+    if learning_curve_path.exists():
+        learning_curve_source = _read(learning_curve_path)
+        learning_curve = learning_curve_source.melt(
+            id_vars=["training_records", "training_fraction"],
+            value_vars=[
+                column
+                for column in [
+                    "mean_validation_reconstruction_score",
+                    "median_validation_reconstruction_score",
+                    "final_validation_loss",
+                ]
+                if column in learning_curve_source
+            ],
+            var_name="معیار",
+            value_name="مقدار",
+        )
+        if not learning_curve.empty:
+            _plot(
+                px.line(
+                    learning_curve,
+                    x="training_records",
+                    y="مقدار",
+                    color="معیار",
+                    markers=True,
+                    hover_data=["training_fraction"],
+                    color_discrete_map={
+                        "mean_validation_reconstruction_score": PLOT_COLORS["violet"],
+                        "median_validation_reconstruction_score": PLOT_COLORS["sky"],
+                        "final_validation_loss": PLOT_COLORS["maroon"],
+                    },
+                ),
+                "۱۰. Learning curve Stage 1 بر حسب حجم داده؛ refitهای کنترل‌شده و غیر deployed",
+                390,
+            )
+    else:
+        _missing_visual(
+            "۱۰. Learning curve بر حسب حجم دادهٔ آموزش",
+            "stage1/learning-curve.parquet",
+            "اجرای جدید چند refit کنترل‌شدهٔ LSTM-AE را برای این نمودار ثبت می‌کند.",
+        )
+
+    calibration = _score_calibration_table(truth, ensemble_score)
+    if not calibration.empty:
+        left, right = st.columns(2)
+        with left:
+            _plot(
+                px.line(
+                    calibration,
+                    x="میانگین_score",
+                    y="نرخ_واقعی_حمله",
+                    markers=True,
+                    color_discrete_sequence=[PLOT_COLORS["violet"]],
+                ),
+                "۱۱. رابطهٔ تجربی score با نرخ واقعی حمله؛ score احتمالِ کالیبره نیست",
+                390,
+            )
+        with right:
+            agreement = (
+                scores.groupby("وضعیت توافق", as_index=False)
+                .agg(رکورد=("record_id", "size"), نرخ_واقعی_حمله=("true_is_attack", "mean"))
+                .sort_values("رکورد", ascending=False)
+            )
+            _plot(
+                px.bar(
+                    agreement,
+                    x="وضعیت توافق",
+                    y="رکورد",
+                    color="نرخ_واقعی_حمله",
+                    color_continuous_scale=[PLOT_COLORS["sky"], PLOT_COLORS["red"]],
+                ),
+                "۱۲. توافق LSTM-AE و IF؛ هر دو/فقط یکی/هیچ‌کدام",
+                390,
+            )
+            st.dataframe(agreement, hide_index=True, width="stretch")
+
+    threshold_rows: list[dict[str, object]] = []
+    for detector, title in [("lstm", "LSTM-AE"), ("isolation_forest", "Isolation Forest")]:
+        config = stage1.get("thresholds", {}).get(detector, {})
+        for key, label in [
+            ("quantile_threshold", "Quantile"),
+            ("mad_threshold", "MAD"),
+            ("threshold", "Final"),
+        ]:
+            if key in config:
+                threshold_rows.append(
+                    {"Detector": title, "مؤلفه": label, "Threshold": config[key]}
+                )
+    calibration_table = pd.DataFrame(threshold_rows)
+    if not calibration_table.empty:
+        _plot(
+            px.bar(
+                calibration_table,
+                x="Detector",
+                y="Threshold",
+                color="مؤلفه",
+                barmode="group",
+                color_discrete_map={
+                    "Quantile": PLOT_COLORS["sky"],
+                    "MAD": PLOT_COLORS["maroon"],
+                    "Final": PLOT_COLORS["violet"],
+                },
+            ),
+            "۱۳. اجزای کالیبراسیون threshold؛ Final = guardrail مؤثر",
+            390,
+        )
+        st.dataframe(calibration_table, hide_index=True, width="stretch")
+
+    timed = _timed_scores(scores)
+    if len(timed) >= 20:
+        timed["_bin"] = pd.qcut(np.arange(len(timed)), q=min(12, len(timed)), duplicates="drop")
+        fpr_time = (
+            timed.loc[~_model_truth(timed)]
+            .groupby("_bin", observed=True, as_index=False)
+            .agg(FPR=("stage1_anomaly", "mean"), زمان=("_time", "min"), رکورد=("_time", "size"))
+        )
+        if not fpr_time.empty:
+            _plot(
+                px.line(
+                    fpr_time,
+                    x="زمان",
+                    y="FPR",
+                    markers=True,
+                    hover_data=["رکورد"],
+                    color_discrete_sequence=[PLOT_COLORS["red"]],
+                ),
+                "۱۴. پایداری FPR در طول زمان آزمون",
+                390,
+            )
+
+    failures = pd.DataFrame(
+        {
+            "خطا": np.select(
+                [
+                    (~truth) & predicted,
+                    truth & (~predicted),
+                ],
+                ["False positive", "False negative"],
+                default="درست",
+            ),
+            "علت تشخیصی": np.select(
+                [
+                    ((~truth) & predicted & scores["تعداد رأی"].eq(1)).to_numpy(),
+                    ((~truth) & predicted & ensemble_score.between(1, 1.12)).to_numpy(),
+                    (truth & (~predicted) & ensemble_score.gt(0.8)).to_numpy(),
+                    (truth & (~predicted)).to_numpy(),
+                ],
+                [
+                    "FP: فقط یک detector رأی داد",
+                    "FP: نزدیک threshold نهایی",
+                    "FN: نزدیک threshold نهایی",
+                    "FN: score بسیار پایین‌تر از threshold",
+                ],
+                default="پیش‌بینی درست",
+            ),
+        }
+    )
+    causes = (
+        failures[failures["خطا"].ne("درست")]
+        .groupby(["خطا", "علت تشخیصی"], as_index=False)
+        .size()
+    )
+    if not causes.empty:
+        _plot(
+            px.bar(
+                causes,
+                x="size",
+                y="علت تشخیصی",
+                color="خطا",
+                orientation="h",
+                color_discrete_map={"False positive": PLOT_COLORS["red"], "False negative": PLOT_COLORS["maroon"]},
+            ),
+            "۱۵. ریشه‌یابی قابل‌ممیزی FP/FN؛ دسته‌بندی تحلیلی، نه علت قطعی شبکه",
+            390,
+        )
+        st.dataframe(causes, hide_index=True, width="stretch")
+
+
+def _stage_two_evaluation(model_root: Path, summary: dict[str, Any]) -> None:
+    """Render the Stage 2 attack-type evaluation without inventing missing probabilities."""
+    stage2 = summary.get("stage2", {})
+    if stage2.get("status") != "trained":
+        st.info(
+            "برای این پروتکل Random Forest آموزش داده نشده است؛ داشبورد نتایج Stage 1 را "
+            "بدون ساختن نمودار یا معیار ساختگی نمایش می‌دهد.",
+            icon=":material/info:",
+        )
+        st.json(stage2)
+        return
+    matrix_path = model_root / "stage2" / "confusion-matrix.parquet"
+    scores_path = model_root / "stage2" / "scores.parquet"
+    importance_path = model_root / "stage2" / "feature-importance.parquet"
+    if not matrix_path.exists() or not scores_path.exists():
+        _notice_missing("ارزیابی Stage 2", "stage2/confusion-matrix.parquet و stage2/scores.parquet")
+        return
+    matrix = _read(matrix_path)
+    stage2_scores = _read_sample(scores_path, 15000)
+    class_report = _stage2_class_report(matrix)
+    if matrix.empty or class_report.empty:
+        st.info("برای Stage 2 حداقل دو کلاس حمله و یک ماتریس confusion لازم است.")
+        return
+    indexed = matrix.set_index("true_attack_type")
+    labels = class_report["نوع حمله"].tolist()
+    numeric_matrix = indexed.loc[labels, labels].to_numpy(dtype=float)
+    macro_f1 = float(class_report["F1"].mean())
+    weighted_f1 = float(
+        np.average(class_report["F1"], weights=class_report["Support"].clip(lower=1))
+    )
+    st.subheader("ارزیابی Stage 2 — طبقه‌بندی نوع حمله با Random Forest", anchor=False)
+    st.caption(
+        "این بخش فقط روی حمله‌های نگاشت‌شده‌ای که به Stage 2 رسیده‌اند ارزیابی می‌شود. "
+        "نمودارهایی که به probability، cross-validation یا hyperparameter sweep نیاز دارند، "
+        "تا تولید artifact مربوطه صادقانه با وضعیت آماده‌سازی نمایش داده می‌شوند."
+    )
+    left, right = st.columns(2)
+    with left:
+        _plot(
+            go.Figure(
+                go.Heatmap(
+                    z=numeric_matrix,
+                    x=labels,
+                    y=labels,
+                    colorscale=[[0, PLOT_COLORS["navy"]], [1, PLOT_COLORS["violet"]]],
+                    text=numeric_matrix.astype(int),
+                    texttemplate="%{text}",
+                )
+            ),
+            "۱۶. Confusion matrix چندکلاسه Stage 2",
+            max(430, 35 * len(labels)),
+        )
+    with right:
+        per_class_melt = class_report.melt(
+            id_vars="نوع حمله",
+            value_vars=["Precision", "Recall", "F1"],
+            var_name="شاخص",
+            value_name="مقدار",
+        )
+        _plot(
+            px.bar(
+                per_class_melt,
+                x="نوع حمله",
+                y="مقدار",
+                color="شاخص",
+                barmode="group",
+                range_y=[0, 1],
+                color_discrete_map={
+                    "Precision": PLOT_COLORS["sky"],
+                    "Recall": PLOT_COLORS["green"],
+                    "F1": PLOT_COLORS["violet"],
+                },
+            ),
+            "۱۷. Precision/Recall/F1 برای هر نوع حمله",
+            430,
+        )
+
+    comparison = pd.DataFrame(
+        {"معیار": ["Macro F1", "Weighted F1"], "مقدار": [macro_f1, weighted_f1]}
+    )
+    left, right = st.columns(2)
+    with left:
+        _plot(
+            px.bar(
+                comparison,
+                x="معیار",
+                y="مقدار",
+                range_y=[0, 1],
+                color="معیار",
+                color_discrete_map={"Macro F1": PLOT_COLORS["maroon"], "Weighted F1": PLOT_COLORS["violet"]},
+            ),
+            "۱۸. Macro-F1 در برابر Weighted-F1؛ شکاف = اثر عدم توازن",
+            360,
+        )
+    with right:
+        _plot(
+            px.scatter(
+                class_report,
+                x="Support",
+                y="Accuracy هر کلاس",
+                size="Support",
+                color="F1",
+                hover_name="نوع حمله",
+                color_continuous_scale=[PLOT_COLORS["maroon"], PLOT_COLORS["green"]],
+            ).update_yaxes(range=[0, 1]),
+            "۲۲. Support در برابر دقت هر کلاس؛ آشکارسازی اثر imbalance",
+            360,
+        )
+    st.dataframe(
+        class_report,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            column: st.column_config.NumberColumn(format="%.2f%%")
+            for column in ["Precision", "Recall", "F1", "Accuracy هر کلاس"]
+        },
+    )
+    _download(class_report, "دانلود گزارش کلاس‌های Stage 2", "stage2-classification-report.csv")
+
+    probability_path = model_root / "stage2" / "probabilities.parquet"
+    stage2_probabilities = _read_sample(probability_path, 20000) if probability_path.exists() else pd.DataFrame()
+    probability_columns = [column for column in stage2_probabilities if column.startswith("probability__")]
+    if not stage2_probabilities.empty and probability_columns and "label" in stage2_probabilities:
+        roc_rows: list[pd.DataFrame] = []
+        for probability_column in probability_columns:
+            attack_type = probability_column.removeprefix("probability__")
+            y_true = stage2_probabilities["label"].astype(str).eq(attack_type)
+            y_score = pd.to_numeric(stage2_probabilities[probability_column], errors="coerce")
+            valid = y_score.notna()
+            if y_true[valid].nunique() < 2:
+                continue
+            fpr, tpr, _ = roc_curve(y_true[valid], y_score[valid])
+            roc_rows.append(pd.DataFrame({"FPR": fpr, "TPR": tpr, "نوع حمله": attack_type}))
+        if roc_rows:
+            _plot(
+                px.line(
+                    pd.concat(roc_rows, ignore_index=True),
+                    x="FPR",
+                    y="TPR",
+                    color="نوع حمله",
+                    line_group="نوع حمله",
+                    color_discrete_sequence=[
+                        PLOT_COLORS["violet"],
+                        PLOT_COLORS["sky"],
+                        PLOT_COLORS["green"],
+                        PLOT_COLORS["maroon"],
+                        PLOT_COLORS["red"],
+                    ],
+                ),
+                "۱۹. ROC یک-در-برابر-بقیه برای هر نوع حمله؛ از احتمال‌های واقعی RF",
+                430,
+            )
+    else:
+        _missing_visual(
+            "۱۹. ROC یک-در-برابر-بقیه برای هر نوع حمله",
+            "stage2/probabilities.parquet",
+            "اجرای جدید Random Forest، احتمال هر کلاس را همراه نتیجهٔ held-out ذخیره می‌کند.",
+        )
+    if importance_path.exists():
+        importance = _read(importance_path).sort_values("importance", ascending=True)
+        left, right = st.columns(2)
+        with left:
+            _plot(
+                px.bar(
+                    importance.tail(20),
+                    x="importance",
+                    y="feature",
+                    orientation="h",
+                    color="importance",
+                    color_continuous_scale=[PLOT_COLORS["sky"], PLOT_COLORS["violet"]],
+                ),
+                "۲۰. اهمیت Gini در Random Forest؛ ۲۰ فیچر برتر",
+                480,
+            )
+        with right:
+            enriched = importance[importance["feature"].isin(["stage1_lstm_score", "stage1_isolation_forest_score"])]
+            if not enriched.empty:
+                _plot(
+                    px.bar(
+                        enriched,
+                        x="feature",
+                        y="importance",
+                        color="feature",
+                        color_discrete_sequence=[PLOT_COLORS["maroon"], PLOT_COLORS["violet"]],
+                    ),
+                    "۲۸. سهم scoreهای Stage 1 به‌عنوان ورودی Stage 2",
+                    480,
+                )
+            else:
+                _missing_visual(
+                    "۲۸. سهم scoreهای Stage 1 در Stage 2",
+                    "stage2/feature-importance.parquet با scoreهای Stage 1",
+                    "این پروفایل بدون افزودن scoreهای Stage 1 به Random Forest آموزش دیده است.",
+                )
+        top_importance = importance.sort_values("importance", ascending=False).head(10).reset_index(drop=True)
+        top_importance.index = top_importance.index + 1
+        top_importance.index.name = "رتبه"
+        st.dataframe(top_importance.reset_index(), hide_index=True, width="stretch")
+    else:
+        _notice_missing("اهمیت فیچرهای Stage 2", "stage2/feature-importance.parquet")
+
+    off_diagonal: list[dict[str, object]] = []
+    for true_position, true_label in enumerate(labels):
+        for predicted_position, predicted_label in enumerate(labels):
+            count = int(numeric_matrix[true_position, predicted_position])
+            if true_position != predicted_position and count:
+                off_diagonal.append(
+                    {
+                        "کلاس واقعی": true_label,
+                        "کلاس پیش‌بینی": predicted_label,
+                        "تعداد خطا": count,
+                        "زوج خطا": f"{true_label} → {predicted_label}",
+                    }
+                )
+    confused = pd.DataFrame(off_diagonal).sort_values("تعداد خطا", ascending=False) if off_diagonal else pd.DataFrame()
+    if not confused.empty:
+        _plot(
+            px.bar(
+                confused.head(15).sort_values("تعداد خطا"),
+                x="تعداد خطا",
+                y="زوج خطا",
+                orientation="h",
+                color="تعداد خطا",
+                color_continuous_scale=[PLOT_COLORS["maroon"], PLOT_COLORS["red"]],
+            ),
+            "۲۳. زوج‌های نوع حمله که بیشتر با هم اشتباه می‌شوند",
+            440,
+        )
+        st.dataframe(confused.head(30), hide_index=True, width="stretch")
+
+    if not stage2_scores.empty and {"label", "predicted_attack_type", "correct"}.issubset(stage2_scores):
+        left, right = st.columns(2)
+        with left:
+            distribution = stage2_scores.groupby("label", as_index=False).size()
+            _plot(
+                px.pie(
+                    distribution,
+                    names="label",
+                    values="size",
+                    hole=0.52,
+                    color_discrete_sequence=[
+                        PLOT_COLORS["violet"],
+                        PLOT_COLORS["maroon"],
+                        PLOT_COLORS["blue"],
+                        PLOT_COLORS["sky"],
+                        PLOT_COLORS["green"],
+                    ],
+                ),
+                "افزوده: ترکیب نوع حمله در آزمون Stage 2",
+                420,
+            )
+        with right:
+            flow = (
+                stage2_scores.groupby(["label", "predicted_attack_type"], as_index=False)
+                .size()
+                .sort_values("size", ascending=False)
+            )
+            _plot(
+                px.sunburst(
+                    flow,
+                    path=["label", "predicted_attack_type"],
+                    values="size",
+                    color="size",
+                    color_continuous_scale=[PLOT_COLORS["sky"], PLOT_COLORS["maroon"]],
+                ),
+                "افزوده: مسیر واقعی → پیش‌بینی‌شدهٔ طبقه‌بندی نوع حمله",
+                420,
+            )
+    stage2_dir = model_root / "stage2"
+    permutation_path = stage2_dir / "permutation-importance.parquet"
+    if permutation_path.exists() and importance_path.exists():
+        gini = _read(importance_path)[["feature", "importance"]]
+        permutation = _read(permutation_path)[["feature", "importance_mean"]]
+        importance_compare = gini.merge(permutation, on="feature", how="inner").melt(
+            id_vars="feature",
+            value_vars=["importance", "importance_mean"],
+            var_name="روش", value_name="اهمیت",
+        )
+        _plot(
+            px.bar(
+                importance_compare[
+                    importance_compare["feature"].isin(
+                        gini.nlargest(15, "importance")["feature"]
+                    )
+                ],
+                x="اهمیت", y="feature", color="روش", barmode="group", orientation="h",
+                color_discrete_map={"importance": PLOT_COLORS["violet"], "importance_mean": PLOT_COLORS["sky"]},
+            ),
+            "۲۱. Permutation importance در برابر Gini؛ هر دو روی held-out",
+            480,
+        )
+    else:
+        _missing_visual(
+            "۲۱. Permutation importance در برابر Gini",
+            "stage2/permutation-importance.parquet",
+            "اجرای جدید در کنار اهمیت Gini، permutation importance را روی آزمون held-out ذخیره می‌کند.",
+        )
+
+    estimator_path = stage2_dir / "n-estimators-sweep.parquet"
+    if estimator_path.exists():
+        estimator_sweep = _read(estimator_path).melt(
+            id_vars="n_estimators", value_vars=["weighted_f1", "accuracy"], var_name="معیار", value_name="مقدار"
+        )
+        _plot(
+            px.line(estimator_sweep, x="n_estimators", y="مقدار", color="معیار", markers=True,
+                    color_discrete_map={"weighted_f1": PLOT_COLORS["violet"], "accuracy": PLOT_COLORS["sky"]}),
+            "۲۴. همگرایی F1 و Accuracy با افزایش n_estimators",
+            380,
+        )
+    else:
+        _missing_visual(
+            "۲۴. همگرایی F1 با افزایش n_estimators",
+            "stage2/n-estimators-sweep.parquet",
+            "اجرای جدید sweep کنترل‌شدهٔ تعداد درخت را ثبت می‌کند.",
+        )
+
+    learning_path = stage2_dir / "learning-curve.parquet"
+    if learning_path.exists():
+        learning = _read(learning_path).melt(
+            id_vars=["training_fraction", "training_records"], value_vars=["weighted_f1", "accuracy"],
+            var_name="معیار", value_name="مقدار",
+        )
+        _plot(
+            px.line(learning, x="training_records", y="مقدار", color="معیار", markers=True,
+                    hover_data=["training_fraction"],
+                    color_discrete_map={"weighted_f1": PLOT_COLORS["violet"], "accuracy": PLOT_COLORS["sky"]}),
+            "۲۵. Learning curve Stage 2؛ حجم آموزش در برابر کیفیت held-out",
+            380,
+        )
+    else:
+        _missing_visual(
+            "۲۵. Learning curve Stage 2",
+            "stage2/learning-curve.parquet",
+            "اجرای جدید چند حجم آموزش stratified را روی test split ثابت ارزیابی می‌کند.",
+        )
+
+    if not stage2_probabilities.empty and {"prediction_confidence", "correct"}.issubset(stage2_probabilities):
+        left, right = st.columns(2)
+        with left:
+            confidence = stage2_probabilities.copy()
+            confidence["نتیجه"] = np.where(confidence["correct"].fillna(False), "درست", "نادرست")
+            _plot(
+                px.histogram(
+                    confidence,
+                    x="prediction_confidence",
+                    color="نتیجه",
+                    barmode="overlay",
+                    nbins=30,
+                    color_discrete_map={"درست": PLOT_COLORS["green"], "نادرست": PLOT_COLORS["red"]},
+                ),
+                "۲۶. Confidence پیش‌بینی درست در برابر نادرست",
+                380,
+            )
+        with right:
+            calibration_source = stage2_probabilities[["prediction_confidence", "correct"]].copy()
+            calibration_source["prediction_confidence"] = pd.to_numeric(
+                calibration_source["prediction_confidence"], errors="coerce"
+            )
+            calibration_source = calibration_source.dropna(subset=["prediction_confidence"])
+            if len(calibration_source) >= 10 and calibration_source["prediction_confidence"].nunique() > 1:
+                calibration_source["bin"] = pd.qcut(
+                    calibration_source["prediction_confidence"], q=min(10, calibration_source["prediction_confidence"].nunique()), duplicates="drop"
+                )
+                calibration = calibration_source.groupby("bin", observed=True, as_index=False).agg(
+                    میانگین_اطمینان=("prediction_confidence", "mean"),
+                    نرخ_واقعی_درستی=("correct", "mean"),
+                    رکورد=("correct", "size"),
+                )
+                _plot(
+                    px.line(
+                        calibration,
+                        x="میانگین_اطمینان",
+                        y="نرخ_واقعی_درستی",
+                        markers=True,
+                        hover_data=["رکورد"],
+                        color_discrete_sequence=[PLOT_COLORS["violet"]],
+                    ).add_shape(
+                        type="line",
+                        x0=0,
+                        y0=0,
+                        x1=1,
+                        y1=1,
+                        line={"dash": "dash", "color": PLOT_COLORS["muted"]},
+                    ),
+                "۲۷. Calibration تجربی Stage 2؛ confidence احتمالِ کالیبره‌شده نیست",
+                380,
+            )
+
+    cross_validation_path = stage2_dir / "cross-validation.parquet"
+    if cross_validation_path.exists():
+        cross_validation = _read(cross_validation_path).melt(
+            id_vars="fold", value_vars=["weighted_f1", "accuracy"], var_name="معیار", value_name="مقدار"
+        )
+        if not cross_validation.empty:
+            _plot(
+                px.bar(cross_validation, x="fold", y="مقدار", color="معیار", barmode="group",
+                       color_discrete_map={"weighted_f1": PLOT_COLORS["violet"], "accuracy": PLOT_COLORS["sky"]}),
+                "۲۹. پایداری F1 در cross-validation Stage 2",
+                380,
+            )
+    else:
+        _missing_visual(
+            "۲۹. پایداری F1 در cross-validation",
+            "stage2/cross-validation.parquet",
+            "اجرای جدید روی بخش آموزش، stratified cross-validation اجرا می‌کند؛ آزمون نهایی جدا می‌ماند.",
+        )
+
+    leaf_path = stage2_dir / "min-samples-leaf-sweep.parquet"
+    if leaf_path.exists():
+        leaf_sweep = _read(leaf_path).melt(
+            id_vars="min_samples_leaf", value_vars=["weighted_f1", "accuracy"], var_name="معیار", value_name="مقدار"
+        )
+        _plot(
+            px.line(leaf_sweep, x="min_samples_leaf", y="مقدار", color="معیار", markers=True,
+                    color_discrete_map={"weighted_f1": PLOT_COLORS["violet"], "accuracy": PLOT_COLORS["sky"]}),
+            "۳۰. حساسیت F1 و Accuracy به min_samples_leaf",
+            380,
+        )
+    else:
+        _missing_visual(
+            "۳۰. حساسیت Accuracy به min_samples_leaf",
+            "stage2/min-samples-leaf-sweep.parquet",
+            "اجرای جدید sweep کنترل‌شدهٔ min_samples_leaf را ثبت می‌کند.",
+        )
+
+    config_table = pd.DataFrame(
+        [
+            {
+                "کلاس‌ها": len(class_report),
+                "رکورد آموزش": stage2.get("training_records"),
+                "رکورد آزمون": stage2.get("test_records"),
+                "ورودی مدل": stage2.get("input_features"),
+                "وزن کلاس": stage2.get("class_weight"),
+                "Weighted F1": stage2.get("weighted_f1"),
+                "Accuracy": stage2.get("test_accuracy"),
+            }
+        ]
+    )
+    st.subheader("جدول پیکربندی و کیفیت Stage 2", anchor=False)
+    st.dataframe(config_table, hide_index=True, width="stretch")
+
+
+def _end_to_end_evaluation(model_root: Path, summary: dict[str, Any]) -> None:
+    """Audit the exact deployed gate: Stage 1 detection followed by Stage 2 typing."""
+    if summary.get("stage2", {}).get("status") != "trained":
+        st.info(
+            "ارزیابی typed end-to-end فقط پس از آموزش Random Forest معنی دارد. "
+            "این مدل Stage 1-only است؛ نتایج anomaly detection را در ارزیابی Stage 1 ببینید.",
+            icon=":material/info:",
+        )
+        return
+    pipeline_dir = model_root / "pipeline"
+    # New runs persist a held-out end-to-end set. Older runs remain readable,
+    # but their charts correctly use the historical deployment-output table.
+    prediction_path = next(
+        (
+            path
+            for path in [
+                pipeline_dir / "end-to-end-evaluation.parquet",
+                pipeline_dir / "end-to-end-probabilities.parquet",
+                pipeline_dir / "end-to-end-predictions.parquet",
+            ]
+            if path.exists()
+        ),
+        pipeline_dir / "end-to-end-predictions.parquet",
+    )
+    resource_path = model_root / "reports" / "resource-usage.parquet"
+    if not prediction_path.exists():
+        _notice_missing("ارزیابی end-to-end", "pipeline/end-to-end-predictions.parquet")
+        return
+    predictions = _read_sample(prediction_path, 20000).copy()
+    if predictions.empty:
+        st.info("خروجی پایپ‌لاین خالی است.")
+        return
+    truth = _model_truth(predictions)
+    gated = predictions.get("stage1_anomaly", pd.Series(False, index=predictions.index)).fillna(False).astype(bool)
+    labels = predictions.get("label", pd.Series("unknown", index=predictions.index)).fillna("unknown").astype(str)
+    typed = predictions.get(
+        "predicted_attack_type", pd.Series("normal", index=predictions.index)
+    ).fillna("normal").astype(str)
+    correctly_typed = truth & gated & typed.eq(labels)
+    wrong_typed = truth & gated & ~typed.eq(labels)
+    missed = truth & ~gated
+    false_alarm = ~truth & gated
+    normal_correct = ~truth & ~gated
+    outcome = np.select(
+        [normal_correct, correctly_typed, wrong_typed, missed, false_alarm],
+        [
+            "نرمال صحیح",
+            "حمله صحیح‌نوع‌بندی‌شده",
+            "حمله با نوع اشتباه",
+            "حملهٔ عبورنکرده از Stage 1",
+            "هشدار کاذب Stage 1",
+        ],
+        default="نامشخص",
+    )
+    predictions["نتیجه end-to-end"] = outcome
+    predictions["کلاس واقعی"] = np.where(truth, "حمله", "نرمال")
+    predictions["alert نهایی"] = gated
+    st.subheader("ارزیابی end-to-end — گیت Stage 1 تا نوع حمله", anchor=False)
+    st.caption(
+        "موفقیت حمله در این بخش یعنی هم از گیت Stage 1 عبور کرده و هم نوع حمله درست پیش‌بینی شده است؛ "
+        "بنابراین با F1 صرفِ Random Forest تفاوت دارد."
+    )
+
+    outcome_counts = (
+        predictions.groupby("نتیجه end-to-end", as_index=False)
+        .size()
+        .sort_values("size", ascending=False)
+    )
+    left, right = st.columns(2)
+    with left:
+        _plot(
+            px.bar(
+                outcome_counts,
+                x="نتیجه end-to-end",
+                y="size",
+                color="نتیجه end-to-end",
+                color_discrete_map={
+                    "نرمال صحیح": PLOT_COLORS["green"],
+                    "حمله صحیح‌نوع‌بندی‌شده": PLOT_COLORS["violet"],
+                    "حمله با نوع اشتباه": PLOT_COLORS["maroon"],
+                    "حملهٔ عبورنکرده از Stage 1": PLOT_COLORS["red"],
+                    "هشدار کاذب Stage 1": PLOT_COLORS["sky"],
+                },
+            ),
+            "۳۱. پنج وضعیت واقعی end-to-end",
+            420,
+        )
+    with right:
+        funnel = pd.DataFrame(
+            [
+                {"گام": "کل رکوردهای ارزیابی", "تعداد": len(predictions)},
+                {"گام": "پرچم Stage 1", "تعداد": int(gated.sum())},
+                {"گام": "ورودی Stage 2", "تعداد": int(gated.sum())},
+                {"گام": "حمله با نوع صحیح", "تعداد": int(correctly_typed.sum())},
+            ]
+        )
+        _plot(
+            px.funnel(
+                funnel,
+                y="گام",
+                x="تعداد",
+                color_discrete_sequence=[PLOT_COLORS["violet"]],
+            ),
+            "۳۲. Funnel واقعی: همهٔ رکوردها → نوع حملهٔ صحیح",
+            420,
+        )
+    st.dataframe(funnel, hide_index=True, width="stretch")
+
+    final_precision = int(correctly_typed.sum()) / max(int(gated.sum()), 1)
+    final_recall = int(correctly_typed.sum()) / max(int(truth.sum()), 1)
+    final_f1 = 2 * final_precision * final_recall / max(final_precision + final_recall, 1e-12)
+    final_metrics = pd.DataFrame(
+        {
+            "معیار": ["Precision نهایی", "Recall نهایی", "F1 نهایی"],
+            "مقدار": [final_precision, final_recall, final_f1],
+        }
+    )
+    left, right = st.columns(2)
+    with left:
+        _plot(
+            px.bar(
+                final_metrics,
+                x="معیار",
+                y="مقدار",
+                range_y=[0, 1],
+                color="معیار",
+                color_discrete_map={
+                    "Precision نهایی": PLOT_COLORS["sky"],
+                    "Recall نهایی": PLOT_COLORS["green"],
+                    "F1 نهایی": PLOT_COLORS["violet"],
+                },
+            ),
+            "۳۳. Precision/Recall/F1 واقعی کل پایپ‌لاین",
+            370,
+        )
+    with right:
+        missed_by_type = (
+            pd.DataFrame({"نوع حمله": labels[missed]})
+            .groupby("نوع حمله", as_index=False)
+            .size()
+            .sort_values("size")
+        )
+        if not missed_by_type.empty:
+            _plot(
+                px.bar(
+                    missed_by_type,
+                    x="size",
+                    y="نوع حمله",
+                    orientation="h",
+                    color="size",
+                    color_continuous_scale=[PLOT_COLORS["maroon"], PLOT_COLORS["red"]],
+                ),
+                "۳۵. حمله‌های عبورنکرده از Stage 1 به تفکیک نوع واقعی",
+                370,
+            )
+    st.dataframe(final_metrics, hide_index=True, width="stretch")
+    _download(funnel, "دانلود funnel پایپ‌لاین", "end-to-end-funnel.csv")
+
+    wasted = predictions.loc[false_alarm].copy()
+    if not wasted.empty:
+        wasted["_bin"] = np.arange(len(wasted)) // max(1, len(wasted) // 12)
+        waste_chart = wasted.groupby("_bin", as_index=False).size()
+        _plot(
+            px.bar(
+                waste_chart,
+                x="_bin",
+                y="size",
+                color="size",
+                color_continuous_scale=[PLOT_COLORS["sky"], PLOT_COLORS["red"]],
+                labels={"_bin": "بازهٔ ترتیبی آزمون", "size": "فراخوانی کاذب Stage 2"},
+            ),
+            "۳۶. فراخوانی‌های بی‌فایدهٔ Stage 2 ناشی از هشدار کاذب",
+            370,
+        )
+
+    timed = _timed_scores(predictions)
+    if not timed.empty:
+        attack_timed = timed[_model_truth(timed)].copy()
+        if not attack_timed.empty:
+            onset = attack_timed.groupby("capture", as_index=False)["_time"].min().rename(
+                columns={"_time": "شروع capture"}
+            )
+            first_alert = (
+                attack_timed[attack_timed["stage1_anomaly"].fillna(False)]
+                .groupby("capture", as_index=False)["_time"]
+                .min()
+                .rename(columns={"_time": "اولین هشدار"})
+            )
+            detection = onset.merge(first_alert, on="capture", how="left")
+            detection["ثانیه تا اولین هشدار"] = (
+                detection["اولین هشدار"] - detection["شروع capture"]
+            ).dt.total_seconds()
+            if detection["ثانیه تا اولین هشدار"].notna().any():
+                _plot(
+                    px.histogram(
+                        detection.dropna(subset=["ثانیه تا اولین هشدار"]),
+                        x="ثانیه تا اولین هشدار",
+                        nbins=30,
+                        color_discrete_sequence=[PLOT_COLORS["violet"]],
+                    ),
+                    "۳۸. زمان تا هشدار؛ proxy از ابتدای capture حمله، نه زمان واقعی رخداد",
+                    370,
+                )
+        timed["_bin"] = pd.qcut(np.arange(len(timed)), q=min(12, len(timed)), duplicates="drop")
+        error_trend = (
+            timed.assign(_error=timed["نتیجه end-to-end"].isin(["حمله با نوع اشتباه", "حملهٔ عبورنکرده از Stage 1", "هشدار کاذب Stage 1"]))
+            .groupby("_bin", observed=True, as_index=False)
+            .agg(نرخ_خطا=("_error", "mean"), زمان=("_time", "min"), رکورد=("_time", "size"))
+        )
+        _plot(
+            px.line(
+                error_trend,
+                x="زمان",
+                y="نرخ_خطا",
+                markers=True,
+                hover_data=["رکورد"],
+                color_discrete_sequence=[PLOT_COLORS["red"]],
+            ),
+            "۴۵. روند نرخ خطای کل پایپ‌لاین در طول زمان آزمون",
+            370,
+        )
+
+    costs = pd.DataFrame(
+        [
+            {"نوع خطا": "False alarm", "تعداد": int(false_alarm.sum()), "هزینهٔ فرضی هر مورد": 1},
+            {"نوع خطا": "نوع حمله اشتباه", "تعداد": int(wrong_typed.sum()), "هزینهٔ فرضی هر مورد": 4},
+            {"نوع خطا": "Missed attack", "تعداد": int(missed.sum()), "هزینهٔ فرضی هر مورد": 10},
+        ]
+    )
+    costs["هزینهٔ کل"] = costs["تعداد"] * costs["هزینهٔ فرضی هر مورد"]
+    left, right = st.columns(2)
+    with left:
+        _plot(
+            px.bar(
+                costs,
+                x="نوع خطا",
+                y="هزینهٔ کل",
+                color="نوع خطا",
+                color_discrete_map={
+                    "False alarm": PLOT_COLORS["sky"],
+                    "نوع حمله اشتباه": PLOT_COLORS["maroon"],
+                    "Missed attack": PLOT_COLORS["red"],
+                },
+                hover_data=["تعداد", "هزینهٔ فرضی هر مورد"],
+            ),
+            "۴۱. هزینهٔ وزن‌دار خطا؛ وزن‌ها سناریوی قابل‌ویرایش‌اند",
+            380,
+        )
+    with right:
+        confidence = _detector_votes(predictions)
+        confidence["سطح اطمینان"] = np.select(
+            [
+                _model_scores(confidence).ge(1.5) & confidence["تعداد رأی"].eq(2),
+                _model_scores(confidence).ge(1.0),
+            ],
+            ["قطعی", "نیازمند بررسی"],
+            default="کم",
+        )
+        tiers = confidence[confidence["stage1_anomaly"].fillna(False)].groupby(
+            "سطح اطمینان", as_index=False
+        ).size()
+        if not tiers.empty:
+            _plot(
+                px.pie(
+                    tiers,
+                    names="سطح اطمینان",
+                    values="size",
+                    hole=0.55,
+                    color="سطح اطمینان",
+                    color_discrete_map={
+                        "قطعی": PLOT_COLORS["red"],
+                        "نیازمند بررسی": PLOT_COLORS["violet"],
+                        "کم": PLOT_COLORS["sky"],
+                    },
+                ),
+                "۴۲. توزیع سطح اطمینان alertهای نهایی",
+                380,
+            )
+    st.dataframe(costs, hide_index=True, width="stretch")
+    _download(costs, "دانلود هزینهٔ وزن‌دار خطا", "end-to-end-cost-summary.csv")
+
+    ablation_path = pipeline_dir / "ablation-comparison.parquet"
+    if ablation_path.exists():
+        ablation = _read(ablation_path)
+        metrics = [
+            column
+            for column in ["accuracy", "macro_f1", "weighted_f1", "attack_recall", "false_positive_rate"]
+            if column in ablation
+        ]
+        if metrics:
+            ablation_chart = ablation.melt(
+                id_vars="model", value_vars=metrics, var_name="معیار", value_name="مقدار"
+            )
+            _plot(
+                px.bar(
+                    ablation_chart,
+                    x="معیار",
+                    y="مقدار",
+                    color="model",
+                    barmode="group",
+                    range_y=[0, 1],
+                    color_discrete_sequence=[PLOT_COLORS["violet"], PLOT_COLORS["sky"]],
+                ),
+                "۳۴. Ablation منصفانه: دومرحله‌ای در برابر Random Forest تک‌مدل",
+                410,
+            )
+            st.dataframe(ablation, hide_index=True, width="stretch")
+    else:
+        _missing_visual(
+            "۳۴. Ablation: معماری دومرحله‌ای در برابر مدل واحد",
+            "pipeline/ablation-comparison.parquet",
+            "این artifact در اجرای جدید، روی همان رکوردهای held-out برای هر دو مدل تولید می‌شود.",
+        )
+
+    latency_path = pipeline_dir / "inference-latency.parquet"
+    latency = _read(latency_path) if latency_path.exists() else pd.DataFrame()
+    if not latency.empty:
+        stage_rows = latency[
+            latency["component"].isin(["LSTM-AE", "Isolation Forest", "Stage 2 Random Forest"])
+        ].copy()
+        if not stage_rows.empty:
+            _plot(
+                px.bar(
+                    stage_rows,
+                    x="component",
+                    y="milliseconds_per_record",
+                    color="component",
+                    hover_data=["records", "seconds", "records_per_second"],
+                    color_discrete_map={
+                        "LSTM-AE": PLOT_COLORS["violet"],
+                        "Isolation Forest": PLOT_COLORS["sky"],
+                        "Stage 2 Random Forest": PLOT_COLORS["maroon"],
+                    },
+                ),
+                "۳۷. latency هر مرحله؛ LSTM-AE / Isolation Forest / Random Forest",
+                390,
+            )
+    else:
+        _missing_visual(
+            "۳۷. تفکیک latency LSTM / IF / RF",
+            "pipeline/inference-latency.parquet",
+            "اجرای جدید benchmark inference را برای هر سه مؤلفه ثبت می‌کند.",
+        )
+
+    sensitivity_path = pipeline_dir / "threshold-sensitivity.parquet"
+    if sensitivity_path.exists():
+        sensitivity = _read(sensitivity_path)
+        metric_columns = [
+            column
+            for column in ["final_precision", "final_recall", "final_f1", "false_positive_rate"]
+            if column in sensitivity
+        ]
+        if metric_columns:
+            sensitivity_chart = sensitivity.melt(
+                id_vars="threshold",
+                value_vars=metric_columns,
+                var_name="معیار نهایی",
+                value_name="مقدار",
+            )
+            _plot(
+                px.line(
+                    sensitivity_chart,
+                    x="threshold",
+                    y="مقدار",
+                    color="معیار نهایی",
+                    markers=True,
+                    color_discrete_map={
+                        "final_precision": PLOT_COLORS["sky"],
+                        "final_recall": PLOT_COLORS["green"],
+                        "final_f1": PLOT_COLORS["violet"],
+                        "false_positive_rate": PLOT_COLORS["red"],
+                    },
+                ).add_vline(x=1, line_dash="dash", line_color=PLOT_COLORS["text"]),
+                "۳۹. حساسیت end-to-end به threshold Stage 1؛ نوع حمله نیز دوباره score شده است",
+                410,
+            )
+            st.dataframe(sensitivity, hide_index=True, width="stretch")
+    else:
+        _missing_visual(
+            "۳۹. حساسیت متریک نهایی به threshold Stage 1",
+            "pipeline/threshold-sensitivity.parquet",
+            "اجرای جدید Stage 2 را برای candidateهای held-out در هر threshold ارزیابی می‌کند.",
+        )
+
+    probability_path = pipeline_dir / "end-to-end-probabilities.parquet"
+    if probability_path.exists():
+        end_to_end_probabilities = _read_sample(probability_path, 20000)
+        success = end_to_end_probabilities.get(
+            "end_to_end_success", pd.Series(False, index=end_to_end_probabilities.index)
+        ).fillna(False).astype(bool)
+        confidence_score = pd.to_numeric(
+            end_to_end_probabilities.get(
+                "end_to_end_confidence", pd.Series(np.nan, index=end_to_end_probabilities.index)
+            ),
+            errors="coerce",
+        )
+        finite_probability = confidence_score.notna()
+        if success[finite_probability].nunique() > 1:
+            fpr, tpr, _ = roc_curve(success[finite_probability], confidence_score[finite_probability])
+            pr_precision, pr_recall, _ = precision_recall_curve(
+                success[finite_probability], confidence_score[finite_probability]
+            )
+            left, right = st.columns(2)
+            with left:
+                _plot(
+                    px.line(
+                        pd.DataFrame({"FPR": fpr, "TPR": tpr}),
+                        x="FPR",
+                        y="TPR",
+                        markers=True,
+                        color_discrete_sequence=[PLOT_COLORS["violet"]],
+                    ),
+                    "۴۰. ROC end-to-end؛ موفقیت = کشف و نوع حملهٔ صحیح",
+                    370,
+                )
+            with right:
+                _plot(
+                    px.line(
+                        pd.DataFrame({"Recall": pr_recall, "Precision": pr_precision}),
+                        x="Recall",
+                        y="Precision",
+                        markers=True,
+                        color_discrete_sequence=[PLOT_COLORS["sky"]],
+                    ),
+                    "۴۰. Precision–Recall end-to-end؛ موفقیت کامل پایپ‌لاین",
+                    370,
+                )
+    else:
+        _missing_visual(
+            "۴۰. ROC/PR end-to-end با تعریف موفقیت نهایی",
+            "pipeline/end-to-end-probabilities.parquet",
+            "اجرای جدید score رتبه‌بندی و احتمال همهٔ کلاس‌های RF را روی held-out ذخیره می‌کند.",
+        )
+
+    stability_path = pipeline_dir / "seed-stability.parquet"
+    if stability_path.exists():
+        stability = _read(stability_path)
+        stability_metrics = [
+            column for column in ["macro_f1", "weighted_f1", "attack_recall", "false_positive_rate"] if column in stability
+        ]
+        if stability_metrics:
+            stability_chart = stability.melt(
+                id_vars="seed", value_vars=stability_metrics, var_name="معیار", value_name="مقدار"
+            )
+            _plot(
+                px.line(
+                    stability_chart,
+                    x="seed",
+                    y="مقدار",
+                    color="معیار",
+                    markers=True,
+                    color_discrete_map={
+                        "macro_f1": PLOT_COLORS["sky"],
+                        "weighted_f1": PLOT_COLORS["violet"],
+                        "attack_recall": PLOT_COLORS["green"],
+                        "false_positive_rate": PLOT_COLORS["red"],
+                    },
+                ),
+                "۴۳. پایداری end-to-end روی seedهای RF؛ Stage 1 ثابت نگه داشته شده است",
+                390,
+            )
+            st.dataframe(stability, hide_index=True, width="stretch")
+    else:
+        _missing_visual(
+            "۴۳. پایداری پایپ‌لاین روی seedهای متفاوت",
+            "pipeline/seed-stability.parquet",
+            "اجرای جدید چند seed را با Stage 1 frozen و split یکسان ثبت می‌کند.",
+        )
+
+    if not latency.empty:
+        throughput = latency[latency["component"].isin(["Stage 1 total", "Full pipeline"])]
+        if not throughput.empty:
+            _plot(
+                px.bar(
+                    throughput,
+                    x="component",
+                    y="records_per_second",
+                    color="component",
+                    hover_data=["records", "milliseconds_per_record"],
+                    color_discrete_map={
+                        "Stage 1 total": PLOT_COLORS["sky"],
+                        "Full pipeline": PLOT_COLORS["violet"],
+                    },
+                ),
+                "۴۴. توان عملیاتی واقعی Stage 1 در برابر کل پایپ‌لاین",
+                380,
+            )
+            st.dataframe(latency, hide_index=True, width="stretch")
+    else:
+        _missing_visual(
+            "۴۴. توان عملیاتی Stage 1 در برابر کل پایپ‌لاین",
+            "pipeline/inference-latency.parquet",
+            "اجرای جدید benchmark inference جداگانه را برای records/sec ثبت می‌کند.",
+        )
+
+    if resource_path.exists():
+        resources = _read(resource_path)
+        if not resources.empty:
+            _plot(
+                px.bar(
+                    resources.melt(
+                        id_vars="point",
+                        value_vars=[column for column in ["process_rss_mb", "memory_percent", "cpu_percent"] if column in resources],
+                        var_name="شاخص منبع",
+                        value_name="مقدار",
+                    ),
+                    x="point",
+                    y="مقدار",
+                    color="شاخص منبع",
+                    barmode="group",
+                    color_discrete_sequence=[PLOT_COLORS["sky"], PLOT_COLORS["maroon"], PLOT_COLORS["violet"]],
+                ),
+                "جدول/نمودار منابع آموزش کامل پایپ‌لاین",
+                390,
+            )
+            st.dataframe(resources, hide_index=True, width="stretch")
 
 
 def _priority_ai_outputs(run: Path, model_root: Path, protocol: str | None) -> None:
@@ -3275,6 +5462,576 @@ def _priority_ai_outputs(run: Path, model_root: Path, protocol: str | None) -> N
     _download(
         detected[priority_columns], "دانلود دادهٔ خروجی‌های اولویت‌دار", "ai-priority-alerts.csv"
     )
+    labelled_types = sorted(
+        value
+        for value in visual.loc[_model_truth(visual), "label"].dropna().astype(str).unique()
+        if value and value.lower() != "unknown"
+    )
+    if labelled_types:
+        st.divider()
+        st.subheader("۲۵ نمای عملیاتی برای هر نوع انومالی", anchor=False)
+        st.caption(
+            "نوع حمله را انتخاب کنید؛ پنج گروه زیر در مجموع همهٔ نماهای مورد نیاز برای یک رخداد "
+            "را با دادهٔ واقعی همان نوع ارائه می‌کنند. «علّی» در اینجا به‌معنای توالی شواهد مدل است، "
+            "نه اثبات علت شبکه‌ای."
+        )
+        selected_type = st.selectbox(
+            "نوع انومالی برای بررسی عمیق",
+            labelled_types,
+            key=f"ai-attack-type-{model_root}",
+        )
+        selected_type_rows = visual[
+            _model_truth(visual) & visual["label"].fillna("").astype(str).eq(selected_type)
+        ].copy()
+        type_alerts = selected_type_rows[
+            selected_type_rows["stage1_anomaly"].fillna(False).astype(bool)
+        ].copy()
+        type_evidence = pd.DataFrame()
+        evidence_path = model_root / "stage1" / "feature-evidence.parquet"
+        if evidence_path.exists():
+            evidence = _read_sample(evidence_path, 40000)
+            type_evidence = evidence[evidence["record_id"].isin(selected_type_rows["record_id"])].copy()
+        if not type_evidence.empty:
+            type_feature_ranking = (
+                type_evidence.groupby("feature", as_index=False)
+                .agg(میانگین_شواهد=("robust_deviation", "mean"), فراوانی=("record_id", "size"))
+                .sort_values("میانگین_شواهد", ascending=False)
+            )
+            top_features = type_feature_ranking["feature"].head(5).tolist()
+        else:
+            type_positions = selected_type_rows.index.to_numpy(dtype=int)
+            top_positions = np.argsort(-robust_distance[type_positions].mean(axis=0))[:5]
+            top_features = [feature_names[int(position)] for position in top_positions]
+            type_feature_ranking = pd.DataFrame(
+                {"feature": top_features, "میانگین_شواهد": robust_distance[type_positions][:, top_positions].mean(axis=0)}
+            )
+        event_groups = [
+            "۱–۵ فضای یادگرفته‌شده",
+            "۶–۱۰ زمان و پایداری",
+            "۱۱–۱۵ تفسیرپذیری",
+            "۱۶–۲۰ عملیات و نوظهوری",
+            "۲۱–۲۵ هشدار و بازیابی",
+        ]
+        event_group = st.segmented_control(
+            "گروه نمودارهای انومالی",
+            event_groups,
+            default=event_groups[0],
+            key=f"ai-event-group-{model_root}",
+            width="stretch",
+        )
+        type_timed = _timed_scores(selected_type_rows)
+        type_sample = _balanced_visual_sample(selected_type_rows, 700)
+        type_sample_embedded = embedded[embedded["record_id"].isin(type_sample["record_id"])].copy()
+        selected_type_row = (
+            type_alerts.sort_values("stage1_normalized_score", ascending=False).iloc[0]
+            if not type_alerts.empty
+            else selected_type_rows.sort_values("stage1_normalized_score", ascending=False).iloc[0]
+        )
+        selected_type_position = visual.index.get_loc(selected_type_row.name)
+        local_type = pd.DataFrame(
+            {
+                "feature": feature_names,
+                "انحراف robust": robust_distance[selected_type_position],
+                "مقدار مدل": values[selected_type_position],
+                "میانه نرمال": normal_median,
+            }
+        ).sort_values("انحراف robust", ascending=False)
+
+        if event_group == event_groups[0]:
+            normal_embedding = embedded[~_model_truth(embedded)].copy()
+            type_embedding = type_sample_embedded.copy()
+            combined_embedding = pd.concat([normal_embedding, type_embedding], ignore_index=True)
+            combined_embedding["گروه"] = np.where(
+                combined_embedding["label"].fillna("").astype(str).eq(selected_type),
+                selected_type,
+                "نرمال",
+            )
+            left, right = st.columns(2)
+            with left:
+                _plot(
+                    px.scatter(
+                        combined_embedding,
+                        x="embedding_1",
+                        y="embedding_2",
+                        color="گروه",
+                        hover_data=["record_id", "capture", "stage1_normalized_score"],
+                        opacity=0.70,
+                        color_discrete_map={"نرمال": PLOT_COLORS["blue"], selected_type: PLOT_COLORS["red"]},
+                    ),
+                    f"۱. جداسازی غیرخطی: {selected_type} در برابر نرمال",
+                    430,
+                )
+            with right:
+                pair = top_features[:2]
+                if len(pair) == 2:
+                    _plot(
+                        px.scatter(
+                            visual.assign(
+                                گروه=np.where(
+                                    visual["label"].fillna("").astype(str).eq(selected_type),
+                                    selected_type,
+                                    "سایر/نرمال",
+                                )
+                            ),
+                            x=pair[0],
+                            y=pair[1],
+                            color="گروه",
+                            opacity=0.62,
+                            color_discrete_map={
+                                selected_type: PLOT_COLORS["red"],
+                                "سایر/نرمال": PLOT_COLORS["blue"],
+                            },
+                        ),
+                        f"۲. تعامل دو فیچر: {pair[0]} × {pair[1]}",
+                        430,
+                    )
+            if len(type_timed) >= 3:
+                trajectory = type_timed.merge(
+                    embedded[["record_id", "embedding_1", "embedding_2"]], on="record_id", how="left"
+                ).dropna(subset=["embedding_1", "embedding_2"])
+                if len(trajectory) >= 3:
+                    trajectory["گام"] = np.arange(1, len(trajectory) + 1)
+                    _plot(
+                        px.line(
+                            trajectory,
+                            x="embedding_1",
+                            y="embedding_2",
+                            markers=True,
+                            hover_data=["_time", "stage1_normalized_score"],
+                            color_discrete_sequence=[PLOT_COLORS["violet"]],
+                        ).add_trace(
+                            go.Scatter(
+                                x=trajectory["embedding_1"],
+                                y=trajectory["embedding_2"],
+                                mode="markers",
+                                marker={
+                                    "color": trajectory["گام"],
+                                    "colorscale": [PLOT_COLORS["sky"], PLOT_COLORS["red"]],
+                                    "showscale": True,
+                                    "colorbar": {"title": "گام"},
+                                },
+                                name="گرادیان زمان",
+                            )
+                        ),
+                        "۳. مسیر گذار در embedding از اولین تا آخرین نمونهٔ این نوع",
+                        430,
+                    )
+            top_profile = local_type.head(min(8, len(local_type))).copy()
+            normal_profile = pd.DataFrame(
+                {
+                    "feature": top_profile["feature"],
+                    "انحراف robust": np.zeros(len(top_profile)),
+                }
+            )
+            profile = pd.concat(
+                [
+                    top_profile.assign(پروفایل="رخداد انتخاب‌شده"),
+                    normal_profile.assign(پروفایل="مرکز نرمال"),
+                ],
+                ignore_index=True,
+            )
+            _plot(
+                px.line_polar(
+                    profile,
+                    r="انحراف robust",
+                    theta="feature",
+                    color="پروفایل",
+                    line_close=True,
+                    color_discrete_map={"رخداد انتخاب‌شده": PLOT_COLORS["red"], "مرکز نرمال": PLOT_COLORS["sky"]},
+                ),
+                "۴. امضای چندبعدی رخداد در برابر پروفایل معمول نرمال",
+                430,
+            )
+            _plot(
+                px.bar(
+                    type_feature_ranking.head(12).sort_values("میانگین_شواهد"),
+                    x="میانگین_شواهد",
+                    y="feature",
+                    orientation="h",
+                    color="میانگین_شواهد",
+                    color_continuous_scale=[PLOT_COLORS["sky"], PLOT_COLORS["red"]],
+                ),
+                "۵. فیچرهای شکل‌دهندهٔ فضای این نوع انومالی",
+                430,
+            )
+
+        elif event_group == event_groups[1]:
+            if not type_timed.empty:
+                type_timed["عبور ثابت تک‌فیچر"] = type_timed["max_single_feature_z"].ge(3.0)
+                left, right = st.columns(2)
+                with left:
+                    timeline = type_timed.melt(
+                        id_vars="_time",
+                        value_vars=["stage1_normalized_score", "max_single_feature_z"],
+                        var_name="سیگنال",
+                        value_name="مقدار",
+                    )
+                    _plot(
+                        px.line(
+                            timeline,
+                            x="_time",
+                            y="مقدار",
+                            color="سیگنال",
+                            color_discrete_map={
+                                "stage1_normalized_score": PLOT_COLORS["red"],
+                                "max_single_feature_z": PLOT_COLORS["sky"],
+                            },
+                        ).add_hline(y=1, line_dash="dash", line_color=PLOT_COLORS["text"]),
+                        "۶. شدت AI پیوسته در برابر شاخص تک‌فیچر ثابت",
+                        420,
+                    )
+                with right:
+                    type_timed["میانهٔ پویا"] = type_timed["stage1_normalized_score"].rolling(
+                        min(25, max(3, len(type_timed) // 8)), min_periods=2
+                    ).median()
+                    type_timed["باند بالا"] = type_timed["stage1_normalized_score"].rolling(
+                        min(25, max(3, len(type_timed) // 8)), min_periods=2
+                    ).quantile(0.90)
+                    band = go.Figure()
+                    band.add_trace(go.Scatter(x=type_timed["_time"], y=type_timed["باند بالا"], line={"width": 0}, showlegend=False))
+                    band.add_trace(go.Scatter(x=type_timed["_time"], y=type_timed["میانهٔ پویا"], fill="tonexty", line={"width": 0}, fillcolor="rgba(124,58,237,.25)", name="باند پویا"))
+                    band.add_trace(go.Scatter(x=type_timed["_time"], y=type_timed["stage1_normalized_score"], line={"color": PLOT_COLORS["red"]}, name="score AI"))
+                    band.add_hline(y=1, line_dash="dash", line_color=PLOT_COLORS["text"])
+                    _plot(band, "۷. باند تطبیقی score در برابر threshold ثابت", 420)
+                alert_start = type_timed[type_timed["stage1_anomaly"].fillna(False)]["_time"].min()
+                static_start = type_timed[type_timed["عبور ثابت تک‌فیچر"]]["_time"].min()
+                timing = pd.DataFrame(
+                    {
+                        "روش": ["AI چندبعدی", "قانون تک‌فیچر z≥3"],
+                        "ثانیه از شروع capture": [
+                            (alert_start - type_timed["_time"].min()).total_seconds() if pd.notna(alert_start) else np.nan,
+                            (static_start - type_timed["_time"].min()).total_seconds() if pd.notna(static_start) else np.nan,
+                        ],
+                    }
+                ).dropna()
+                if not timing.empty:
+                    _plot(
+                        px.bar(
+                            timing,
+                            x="روش",
+                            y="ثانیه از شروع capture",
+                            color="روش",
+                            color_discrete_map={"AI چندبعدی": PLOT_COLORS["violet"], "قانون تک‌فیچر z≥3": PLOT_COLORS["sky"]},
+                        ),
+                        "۸. زمان هشدار AI و قانون ثابت؛ proxy از اولین packet capture",
+                        360,
+                    )
+                type_timed["لرزش کوتاه‌مدت"] = type_timed["stage1_normalized_score"].rolling(8, min_periods=2).std()
+                _plot(
+                    px.line(
+                        type_timed,
+                        x="_time",
+                        y="لرزش کوتاه‌مدت",
+                        color_discrete_sequence=[PLOT_COLORS["maroon"]],
+                    ),
+                    "۹. Confidence jitter؛ انحراف معیار متحرک score",
+                    360,
+                )
+                alert_strip = type_timed.assign(
+                    شدت=pd.cut(
+                        type_timed["stage1_normalized_score"],
+                        [-np.inf, 0.8, 1.0, 1.5, np.inf],
+                        labels=["نرمال", "مرزی", "هشدار", "شدید"],
+                    )
+                )
+                _plot(
+                    px.scatter(
+                        alert_strip,
+                        x="_time",
+                        y=np.zeros(len(alert_strip)),
+                        color="شدت",
+                        symbol="شدت",
+                        color_discrete_map={
+                            "نرمال": PLOT_COLORS["blue"],
+                            "مرزی": PLOT_COLORS["sky"],
+                            "هشدار": PLOT_COLORS["violet"],
+                            "شدید": PLOT_COLORS["red"],
+                        },
+                    ).update_yaxes(visible=False),
+                    "۱۰. نوار زمانی alert با کد شدت",
+                    260,
+                )
+            else:
+                _notice_missing("نمودارهای زمانی نوع انومالی", "timestamp در stage1/scores.parquet")
+
+        elif event_group == event_groups[2]:
+            if not type_evidence.empty:
+                evidence_heat = type_evidence[type_evidence["feature"].isin(top_features)].copy()
+                evidence_heat = evidence_heat.merge(
+                    selected_type_rows[["record_id", "timestamp"]], on="record_id", how="left"
+                )
+                evidence_heat["زمان"] = pd.to_datetime(evidence_heat["timestamp"], errors="coerce", utc=True)
+                evidence_heat = evidence_heat.sort_values(["زمان", "feature"])
+                matrix_evidence = evidence_heat.pivot_table(
+                    index="feature", columns="record_id", values="robust_deviation", aggfunc="mean", fill_value=0
+                )
+                if not matrix_evidence.empty:
+                    _plot(
+                        go.Figure(
+                            go.Heatmap(
+                                z=matrix_evidence.to_numpy(),
+                                x=matrix_evidence.columns.astype(str),
+                                y=matrix_evidence.index,
+                                colorscale=[[0, PLOT_COLORS["navy"]], [0.5, PLOT_COLORS["violet"]], [1, PLOT_COLORS["red"]]],
+                            )
+                        ),
+                        "۱۱. Saliency زمان×فیچر؛ شواهد robust برای رخدادهای این نوع",
+                        430,
+                    )
+            if len(type_timed) >= 12 and len(top_features) >= 2:
+                first_feature, second_feature = top_features[:2]
+                rolling_corr = type_timed[first_feature].rolling(12, min_periods=6).corr(type_timed[second_feature])
+                _plot(
+                    px.line(
+                        pd.DataFrame({"زمان": type_timed["_time"], "همبستگی متحرک": rolling_corr}),
+                        x="زمان",
+                        y="همبستگی متحرک",
+                        color_discrete_sequence=[PLOT_COLORS["violet"]],
+                    ),
+                    f"۱۲. شکست/تغییر همبستگی: {first_feature} با {second_feature}",
+                    370,
+                )
+            _plot(
+                go.Figure(
+                    go.Waterfall(
+                        orientation="h",
+                        measure=["relative"] * len(local_type.head(12)),
+                        y=local_type.head(12)["feature"],
+                        x=local_type.head(12)["انحراف robust"],
+                        increasing={"marker": {"color": PLOT_COLORS["red"]}},
+                    )
+                ),
+                "۱۳. Waterfall سهم فیچرها برای شدیدترین رخداد انتخاب‌شده؛ SHAP نیست",
+                440,
+            )
+            normal_neighbour = normal_values[np.argmin(np.linalg.norm(normal_values - values[selected_type_position], axis=1))]
+            nearest_profile = local_type.head(12).copy()
+            nearest_profile["نزدیک‌ترین نرمال"] = normal_neighbour[
+                [feature_names.index(name) for name in nearest_profile["feature"]]
+            ]
+            nearest_profile = nearest_profile.melt(
+                id_vars="feature",
+                value_vars=["مقدار مدل", "نزدیک‌ترین نرمال"],
+                var_name="نمونه",
+                value_name="مقدار",
+            )
+            _plot(
+                px.bar(
+                    nearest_profile,
+                    x="feature",
+                    y="مقدار",
+                    color="نمونه",
+                    barmode="group",
+                    color_discrete_map={"مقدار مدل": PLOT_COLORS["red"], "نزدیک‌ترین نرمال": PLOT_COLORS["sky"]},
+                ),
+                "۱۴. بازیابی نزدیک‌ترین نمونهٔ نرمال در فضای یادگرفته‌شده",
+                430,
+            )
+            _plot(
+                px.bar(
+                    type_feature_ranking.head(12),
+                    x="feature",
+                    y="میانگین_شواهد",
+                    color="میانگین_شواهد",
+                    color_continuous_scale=[PLOT_COLORS["sky"], PLOT_COLORS["red"]],
+                ),
+                "۱۵. نرخ ظهور شواهد فیچرهای غالب برای این نوع",
+                400,
+            )
+
+        elif event_group == event_groups[3]:
+            score = float(selected_type_row.get("stage1_normalized_score", 0))
+            maximum = max(2.0, min(6.0, float(_model_scores(visual).max()) * 1.05))
+            left, right = st.columns(2)
+            with left:
+                _plot(
+                    go.Figure(
+                        go.Indicator(
+                            mode="gauge+number",
+                            value=score,
+                            number={"suffix": "× threshold"},
+                            gauge={
+                                "axis": {"range": [0, maximum]},
+                                "bar": {"color": PLOT_COLORS["red"]},
+                                "steps": [
+                                    {"range": [0, 0.8], "color": "#1B6A4A"},
+                                    {"range": [0.8, 1], "color": "#8B6A1E"},
+                                    {"range": [1, maximum], "color": "#5B1E3C"},
+                                ],
+                                "threshold": {"line": {"color": PLOT_COLORS["text"], "width": 3}, "value": 1},
+                            },
+                        )
+                    ),
+                    "۱۶. وضعیت زندهٔ شدیدترین رخداد این نوع",
+                    360,
+                )
+            with right:
+                neighbours = NearestNeighbors(n_neighbors=1).fit(normal_values).kneighbors(
+                    values[selected_type_rows.index.to_numpy(dtype=int)]
+                )[0].ravel()
+                _plot(
+                    px.histogram(
+                        pd.DataFrame({"فاصله از نزدیک‌ترین نرمال": neighbours}),
+                        x="فاصله از نزدیک‌ترین نرمال",
+                        nbins=32,
+                        color_discrete_sequence=[PLOT_COLORS["violet"]],
+                    ),
+                    "۱۷. Novelty / OOD؛ فاصلهٔ رخدادهای این نوع از نرمال‌های آموزش",
+                    360,
+                )
+            if not type_timed.empty:
+                score_rows = type_timed.melt(
+                    id_vars="_time",
+                    value_vars=["stage1_normalized_score", *top_features[:3]],
+                    var_name="سیگنال",
+                    value_name="مقدار",
+                )
+                _plot(
+                    px.line(
+                        score_rows,
+                        x="_time",
+                        y="مقدار",
+                        facet_row="سیگنال",
+                        color="سیگنال",
+                        color_discrete_sequence=[PLOT_COLORS["red"], PLOT_COLORS["sky"], PLOT_COLORS["violet"], PLOT_COLORS["green"]],
+                    ),
+                    "۱۸. Small multiples؛ score و سیگنال‌های کلیدی روی زمان مشترک",
+                    650,
+                )
+                load = (
+                    type_timed.assign(_bin=pd.qcut(np.arange(len(type_timed)), q=min(12, len(type_timed)), duplicates="drop"))
+                    .groupby("_bin", observed=True, as_index=False)
+                    .agg(بار_ترافیک=("record_id", "size"), شدت_میانگین=("stage1_normalized_score", "mean"), زمان=("_time", "min"))
+                )
+                _plot(
+                    px.scatter(
+                        load,
+                        x="بار_ترافیک",
+                        y="شدت_میانگین",
+                        size="بار_ترافیک",
+                        hover_data=["زمان"],
+                        color="شدت_میانگین",
+                        color_continuous_scale=[PLOT_COLORS["sky"], PLOT_COLORS["red"]],
+                    ),
+                    "۱۹. رابطهٔ بار ترافیک با شدت انومالی این نوع",
+                    400,
+                )
+                hosts = type_timed.copy()
+                hosts["گره"] = hosts.get("src_ip", "نامشخص").astype(str) + " → " + hosts.get("dst_ip", "نامشخص").astype(str)
+                _plot(
+                    px.scatter(
+                        hosts,
+                        x="_time",
+                        y="گره",
+                        size="stage1_normalized_score",
+                        color="stage1_normalized_score",
+                        color_continuous_scale=[PLOT_COLORS["sky"], PLOT_COLORS["red"]],
+                    ),
+                    "۲۰. انتشار زمانی سیگنال بین گره‌های مبدأ → مقصد",
+                    450,
+                )
+
+        else:
+            top_contributors = type_evidence[type_evidence["stage1_anomaly"].fillna(False)] if not type_evidence.empty else pd.DataFrame()
+            if not top_contributors.empty:
+                recognition = (
+                    top_contributors.groupby("feature", as_index=False)
+                    .agg(هشدار=("record_id", "nunique"), میانگین_شواهد=("robust_deviation", "mean"))
+                    .sort_values("هشدار", ascending=False)
+                )
+                _plot(
+                    px.bar(
+                        recognition.head(12),
+                        x="feature",
+                        y="هشدار",
+                        color="میانگین_شواهد",
+                        color_continuous_scale=[PLOT_COLORS["violet"], PLOT_COLORS["red"]],
+                    ),
+                    "۲۱. بازشناسی رخدادهای این نوع بر پایهٔ شواهد پرتکرار",
+                    400,
+                )
+            forest_path = model_root / "stage1" / "isolation-forest.joblib"
+            if forest_path.exists():
+                forest = _isolation_forest(str(forest_path), forest_path.stat().st_mtime_ns)
+                source_values = values[selected_type_rows.index.to_numpy(dtype=int)]
+                rng = np.random.default_rng(42)
+                noisy = source_values + rng.normal(0, 0.03, source_values.shape)
+                clean_if = -forest.score_samples(source_values)
+                noisy_if = -forest.score_samples(noisy)
+                stability = pd.DataFrame({"بدون نویز": clean_if, "با نویز ۳٪": noisy_if}).melt(
+                    var_name="وضعیت", value_name="امتیاز IF"
+                )
+                _plot(
+                    px.box(
+                        stability,
+                        x="وضعیت",
+                        y="امتیاز IF",
+                        color="وضعیت",
+                        color_discrete_map={"بدون نویز": PLOT_COLORS["violet"], "با نویز ۳٪": PLOT_COLORS["maroon"]},
+                    ),
+                    "۲۲. پایداری مؤلفهٔ IF در برابر نویز مصنوعی ۳٪",
+                    390,
+                )
+            if not type_timed.empty:
+                recovery_rows: list[pd.DataFrame] = []
+                for capture, capture_rows in type_timed.groupby("capture", dropna=False):
+                    capture_rows = capture_rows.sort_values("_time")
+                    peak_position = int(capture_rows["stage1_normalized_score"].to_numpy().argmax())
+                    after_peak = capture_rows.iloc[peak_position:].copy()
+                    after_peak["گام بعد از اوج"] = np.arange(len(after_peak))
+                    after_peak["capture"] = str(capture)
+                    recovery_rows.append(after_peak.head(80))
+                recovery = pd.concat(recovery_rows, ignore_index=True) if recovery_rows else pd.DataFrame()
+                if not recovery.empty:
+                    _plot(
+                        px.line(
+                            recovery,
+                            x="گام بعد از اوج",
+                            y="stage1_normalized_score",
+                            color="capture",
+                            line_group="capture",
+                        ).add_hline(y=1, line_dash="dash", line_color=PLOT_COLORS["text"]),
+                        "۲۳. مسیر بازگشت score به نرمال بعد از اوج هر capture",
+                        430,
+                    )
+                causal_rows = type_timed.copy()
+                causal_rows["مرحله"] = pd.cut(
+                    causal_rows["stage1_normalized_score"],
+                    [-np.inf, 0.8, 1.0, 1.5, np.inf],
+                    labels=["نرمال", "مرزی", "هشدار", "شدید"],
+                )
+                chain = causal_rows.groupby("مرحله", observed=True, as_index=False).agg(
+                    زمان=("_time", "min"), میانگین_score=("stage1_normalized_score", "mean"), رکورد=("record_id", "size")
+                )
+                _plot(
+                    px.scatter(
+                        chain,
+                        x="زمان",
+                        y="مرحله",
+                        size="رکورد",
+                        color="میانگین_score",
+                        color_continuous_scale=[PLOT_COLORS["sky"], PLOT_COLORS["red"]],
+                    ),
+                    "۲۴. زنجیرهٔ توالی شواهد: نرمال → مرزی → هشدار → شدید",
+                    370,
+                )
+            alert_summary = pd.DataFrame(
+                [
+                    {"فیچر": row["feature"], "رخداد انتخاب‌شده": row["انحراف robust"]}
+                    for _, row in local_type.head(10).iterrows()
+                ]
+            )
+            _plot(
+                px.bar(
+                    alert_summary,
+                    x="فیچر",
+                    y="رخداد انتخاب‌شده",
+                    color="رخداد انتخاب‌شده",
+                    color_continuous_scale=[PLOT_COLORS["violet"], PLOT_COLORS["red"]],
+                ),
+                "۲۵. پروفایل شدت رخداد فعلی برای اقدام عملیاتی",
+                400,
+            )
     st.caption(
         "مقایسه با سامانهٔ rule-based قدیمی، حجم هشدار گذشته، Geo-IP، زمان پاسخ تحلیلگر و "
         "throughput "
@@ -3649,10 +6406,14 @@ def _models_enhanced(run: Path, artifact_root: Path, protocol: str | None) -> No
     model_root = selected.parent
     stage1 = summary.get("stage1", {})
     stage2 = summary.get("stage2", {})
+    stage2_available = stage2.get("status") == "trained" and stage2.get("weighted_f1") is not None
     cards = st.columns(4)
     cards[0].metric("Stage 1 — FPR", f"{float(stage1.get('false_positive_rate', 0)):.2%}")
     cards[1].metric("Stage 1 — Recall", f"{float(stage1.get('recall', 0)):.2%}")
-    cards[2].metric("Stage 2 — Weighted F1", f"{float(stage2.get('weighted_f1', 0)):.2%}")
+    cards[2].metric(
+        "Stage 2 — Weighted F1",
+        f"{float(stage2['weighted_f1']):.2%}" if stage2_available else "در دسترس نیست",
+    )
     cards[3].metric("زمان آموزش", f"{float(summary.get('training_seconds', 0)):.1f} ثانیه")
     if float(stage1.get("recall", 1)) < 0.30:
         st.warning(
@@ -3674,23 +6435,49 @@ def _models_enhanced(run: Path, artifact_root: Path, protocol: str | None) -> No
             "FPR": st.column_config.NumberColumn(format="%.2f%%"),
         },
     )
+    if not stage2_available:
+        st.info(
+            "این مدل در حالت Stage 1-only ذخیره شده است؛ دادهٔ برچسب‌دارِ پذیرفته‌شده برای "
+            "ارزیابی منصفانهٔ Random Forest کافی نبوده است. تمام نتایج Stage 1 و خروجی anomaly "
+            "همچنان معتبر و قابل استفاده‌اند.",
+            icon=":material/info:",
+        )
+        with st.expander("علت آماده‌نبودن Stage 2"):
+            st.json(stage2)
 
-    output_views = [
-        "اولویت: مزیت AI",
-        "Stage 1: ناهنجاری",
-        "شواهد فیچر",
-        "Stage 2: نوع حمله",
-        "پایپ‌لاین و منابع",
-    ]
-    output_view = st.segmented_control(
-        "نمای خروجی مدل",
-        output_views,
-        default=output_views[0],
-        key=f"model-output-view-{model_root}",
+    output_group = st.segmented_control(
+        "بخش خروجی مدل",
+        ["تحلیل و مزیت AI", "ارزیابی دقیق", "جزئیات فنی و فایل‌ها"],
+        default="تحلیل و مزیت AI",
+        key=f"model-output-group-{model_root}",
         width="stretch",
     )
+    if output_group == "تحلیل و مزیت AI":
+        output_view = "اولویت: مزیت AI"
+    elif output_group == "ارزیابی دقیق":
+        output_view = st.segmented_control(
+            "مرحلهٔ ارزیابی",
+            ["ارزیابی Stage 1 (۱۵ نمودار)", "ارزیابی Stage 2 (۱۵ نمودار)", "ارزیابی end-to-end (۱۵ نمودار)"],
+            default="ارزیابی Stage 1 (۱۵ نمودار)",
+            key=f"model-evaluation-view-{model_root}",
+            width="stretch",
+        )
+    else:
+        output_view = st.segmented_control(
+            "جزئیات مورد نیاز",
+            ["Stage 1: ناهنجاری", "شواهد فیچر", "Stage 2: نوع حمله", "پایپ‌لاین و منابع"],
+            default="شواهد فیچر",
+            key=f"model-detail-view-{model_root}",
+            width="stretch",
+        )
     if output_view == "اولویت: مزیت AI":
         _priority_ai_outputs(run, model_root, protocol)
+    elif output_view == "ارزیابی Stage 1 (۱۵ نمودار)":
+        _stage_one_evaluation(model_root, summary)
+    elif output_view == "ارزیابی Stage 2 (۱۵ نمودار)":
+        _stage_two_evaluation(model_root, summary)
+    elif output_view == "ارزیابی end-to-end (۱۵ نمودار)":
+        _end_to_end_evaluation(model_root, summary)
     elif output_view == "Stage 1: ناهنجاری":
         score_path = model_root / "stage1" / "scores.parquet"
         history_path = model_root / "stage1" / "lstm-training-history.parquet"
@@ -3924,6 +6711,8 @@ def _models_enhanced(run: Path, artifact_root: Path, protocol: str | None) -> No
     elif output_view == "شواهد فیچر":
         _feature_evidence_enhanced(model_root)
     elif output_view == "Stage 2: نوع حمله":
+        if not stage2_available:
+            st.warning("Stage 2 برای این پروتکل آموزش داده نشده است؛ فقط نتیجهٔ Stage 1 نمایش داده می‌شود.")
         importance_path = model_root / "stage2" / "feature-importance.parquet"
         confusion_path = model_root / "stage2" / "confusion-matrix.parquet"
         scores_path = model_root / "stage2" / "scores.parquet"

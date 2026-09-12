@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pandas as pd
 
-from anomdet.preprocessing.pipeline import prepare_features, read_training_source
+from anomdet.preprocessing.pipeline import (
+    prepare_features,
+    read_training_source,
+    transform_with_manifest,
+)
 from anomdet.selection.profiles import create_profile, load_profile
 
 
@@ -156,3 +160,41 @@ def test_per_protocol_default_excludes_foreign_schema_features(tmp_path) -> None
     assert "modbus_quantity" in manifest["selected_input_features"]
     assert "dns_rcode" not in manifest["selected_input_features"]
     assert "http_status_code" not in manifest["selected_input_features"]
+
+
+def test_preparation_handles_pandas_na_in_categorical_protocol_features(tmp_path) -> None:
+    """Nullable Parquet strings must not make sklearn's categorical imputer crash."""
+    config = {
+        "project": {"artifact_dir": str(tmp_path / "artifacts")},
+        "features": {"high_cardinality_max_categories": 50},
+        "preprocessing": {
+            "min_non_null_ratio": 0.05,
+            "numeric_scaler": "robust",
+            "categorical_encoder": "onehot",
+        },
+    }
+    profile = create_profile(
+        "http-null-safe",
+        ["packet_length", "http_method", "http_status_code"],
+        config,
+        protocols=["http"],
+    )
+    source = pd.DataFrame(
+        {
+            "flow_id": ["a", "b", "c", "d", "e"],
+            "protocol": pd.Series(["http"] * 5, dtype="string"),
+            "packet_length": [100, 101, 102, 103, 104],
+            "http_method": pd.Series(["GET", pd.NA, "POST", "GET", pd.NA], dtype="string"),
+            "http_status_code": pd.Series([200, 200, 404, pd.NA, 500], dtype="Int64"),
+        }
+    )
+    source_path = tmp_path / "http-nullable.parquet"
+    output_path = tmp_path / "prepared.parquet"
+    source.to_parquet(source_path, index=False)
+
+    prepared, manifest, pipeline_path = prepare_features(source_path, output_path, config, profile)
+    transformed, names = transform_with_manifest(source, pipeline_path, manifest)
+
+    assert len(prepared) == len(source)
+    assert len(transformed) == len(source)
+    assert names == manifest["selected_input_features"] or len(names) > 0

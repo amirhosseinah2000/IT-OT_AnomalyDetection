@@ -7,7 +7,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from anomdet.core.io import read_table, utc_now, write_json, write_table
 from anomdet.features.catalog import FEATURE_CATALOG, feature_names
@@ -92,7 +94,35 @@ def load_profile(profile: str | Path, config: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def feature_quality_report(feature_path: Path, output_path: Path) -> pd.DataFrame:
+def _analysis_source(
+    feature_path: Path, maximum_rows: int | None
+) -> tuple[pd.DataFrame, int, bool]:
+    """Read a time-spread Parquet sample for bounded analytical reports."""
+
+    if maximum_rows is None or feature_path.suffix.lower() not in {".parquet", ".pq"}:
+        frame = read_table(feature_path)
+        return frame, len(frame), False
+    parquet = pq.ParquetFile(feature_path)
+    total = int(parquet.metadata.num_rows)
+    if total <= maximum_rows:
+        return read_table(feature_path), total, False
+    groups = np.unique(
+        np.linspace(0, parquet.num_row_groups - 1, num=min(parquet.num_row_groups, 32), dtype=int)
+    )
+    rows_per_group = max(1, maximum_rows // len(groups))
+    pieces: list[pd.DataFrame] = []
+    for group in groups:
+        piece = parquet.read_row_group(int(group)).to_pandas()
+        if len(piece) > rows_per_group:
+            positions = np.linspace(0, len(piece) - 1, num=rows_per_group, dtype=int)
+            piece = piece.iloc[positions]
+        pieces.append(piece)
+    return pd.concat(pieces, ignore_index=True, sort=False), total, True
+
+
+def feature_quality_report(
+    feature_path: Path, output_path: Path, maximum_rows: int | None = 100_000
+) -> pd.DataFrame:
     """Validate computed catalogue features separately for every observed protocol.
 
     A schema column alone is not evidence that an extractor observed useful
@@ -100,7 +130,7 @@ def feature_quality_report(feature_path: Path, output_path: Path) -> pd.DataFram
     sparse fields, and model-usable fields without treating a legitimate rare
     security event as an extraction failure.
     """
-    frame = read_table(feature_path)
+    frame, source_rows_total, sampled_for_analysis = _analysis_source(feature_path, maximum_rows)
     rows: list[dict[str, Any]] = []
     protocols = (
         sorted(frame["protocol"].dropna().astype("string").str.lower().unique().tolist())
@@ -192,6 +222,8 @@ def feature_quality_report(feature_path: Path, output_path: Path) -> pd.DataFram
                     "implementation_status": implementation_status,
                     "present": present,
                     "records": record_count,
+                    "source_records_total": source_rows_total,
+                    "sampled_for_analysis": sampled_for_analysis,
                     "flow_count": flow_count,
                     "observed_count": observed,
                     "observed_ratio": round(observed_ratio, 4),

@@ -20,9 +20,70 @@ capture:
 
 Run a command with `uv run anomaly --config config/lab-64gb.yaml extract capture.pcap`.
 
+For a deliberately small reproducible run, `data.capture_allowlist` can name
+the exact PCAP/PCAPNG filenames to use for each protocol and split.  It is
+intended for smoke tests and targeted re-processing; omit it for a complete
+folder-first run.  `config/smoke-4protocol-200.yaml` is the repository's
+ready-made four-protocol example.
+
 `runtime.memory_limit_gb` is a soft safety threshold for scheduling and operator review. The platform records resource snapshots at command startup; it does not attempt to reserve host memory or alter system-wide CPU affinity.
 
+`capture.dataset_default_packet_cap` is the safe default for `dataset extract` and `dataset run`.
+For a trial it retains a deterministic, time-spread sample per capture.  Large
+values passed through `--max-packets N` automatically use the disk-backed
+extractor: it writes fixed-size Parquet row groups and never accumulates raw
+packets or the whole feature table in RAM.
+
+For a full archive, use the explicit production override and `--all-packets`:
+
+```bash
+RUN="artifacts/runs/final-20260907"
+uv run anomaly --config config/production-streaming.yaml dataset extract \
+  --output "$RUN" \
+  --all-packets
+uv run anomaly --config config/production-streaming.yaml dataset map "$RUN"
+```
+
+`dataset extract` reads every packet once and writes one feature Parquet per
+protocol/capture. `dataset map` subsequently maps CSV labels in batches from
+those saved files, without reopening the PCAP. It needs free disk space for the
+output, but has a bounded working-memory footprint. Keep `streaming_unbounded:
+false` in configuration; the explicit CLI flag is a guard against starting an
+unlimited run by accident.
+
 `mapping.timestamp_dayfirst` controls the parsing order for ambiguous label timestamps. It defaults to `true`, which suits common CIC-style `day/month/year` CSV exports. Change it only if a dataset documents month-first timestamps.
+
+## Reusable packet-to-CSV mapping
+
+`mapping.cache_enabled` is on by default. The first `dataset map` creates a compact,
+versioned `packet-csv-links.parquet` relation under
+`<artifact_dir>/mapping_cache/`. It records `packet_uid`, original packet
+index, timestamp, flow, CSV row, label, confidence, and acceptance decision.
+Later mapping runs reuse that relation when the PCAP/CSV file snapshots, mapping
+policy, protocol, and packet cap are unchanged. New or changed inputs automatically
+create a new entry. Use `anomaly dataset map <dataset-run> --remap` only to force a
+rebuild of an unchanged entry.
+
+The mapping still visits every extracted PCAP packet. It uses endpoint/time
+indexes to test every compatible CSV candidate rather than performing an
+unbounded Cartesian comparison with unrelated rows. `mapping-progress.json`
+and console logs expose `mapping_cache_hit`, `mapping_cache_miss`, and
+`packet_mapping_progress` events.
+
+## Stage 2 readiness and held-out evaluation
+
+`stage_two.min_training_records` (default `20`),
+`stage_two.min_records_per_class` (default `4`), and
+`stage_two.require_multiple_attack_types` decide whether the Random Forest can
+be trained honestly. If they are not met, `two-stage train` still trains and
+packages LSTM-AE + Isolation Forest, writes `stage2/readiness.json`, and marks
+Stage 2 as `skipped`; it never fabricates an RF metric.
+
+When possible, Stage 2 holds out complete captures for test using a stratified
+group split. Small datasets that cannot retain every class in the training
+captures use a recorded `stratified_packet_fallback`. Inspect
+`stage2/held-out-split.parquet` and `stage2/metrics.json` before comparing
+models.
 
 The `data` section defines the standard dataset roots for the deployment. `anomaly extract` accepts either one capture or a protocol folder. `pipeline run` discovers direct PCAP/PCAPNG files in protocol-named folders below `raw_pcap_dir`, keeping each source capture in the output manifest.
 
@@ -75,18 +136,18 @@ The following `pipeline run` compares `all_features` against every selected prof
 
 ```yaml
 models:
-  # Maximum protocol records used by one interactive model experiment.
-  # Set null only for an offline full-table run with sufficient memory.
-  max_source_rows: 100000
+  # Deterministic, time-spread fit population from the disk-backed corpus.
+  # It is a global cap across a protocol's capture files, not a cap per file.
+  max_source_rows: 250000
   split_strategy: temporal
   lstm_autoencoder:
-    sequence_length: 10
-    sequence_stride: 10
-    hidden_size: 128
-    latent_size: 64
-    epochs: 100
+    sequence_length: 8
+    sequence_stride: 8
+    hidden_size: null # resolved from the selected feature count
+    latent_size: null # resolved from the selected feature count
+    epochs: 60
     max_train_windows: 5000
     device: cpu
 ```
 
-Set `models.split_strategy: random` only when rows are independently distributed and a temporal hold-out is not appropriate. `max_source_rows` is a deterministic time-spread model sample, designed to keep interactive runs within memory. For a final offline study, set it to `null` only when the machine has enough RAM for the full table.
+Set `models.split_strategy: random` only when rows are independently distributed and a temporal hold-out is not appropriate. `max_source_rows` is a deterministic time-spread model population, designed to keep CPU/RAM bounded while preserving coverage of each capture. Increase it gradually (for example, 250,000 to 500,000) only after observing RAM and training time. Setting it to `null` deliberately loads the entire table and is not the safe production path.

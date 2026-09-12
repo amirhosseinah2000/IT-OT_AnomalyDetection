@@ -40,6 +40,16 @@ packages = ["src/anomdet"]
 [tool.uv]
 package = true
 
+# The platform is CPU-first by contract.  Pinning torch to the official CPU
+# index prevents a Linux/WSL install from downloading unused CUDA runtimes.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 [dependency-groups]
 dev = [
     "pytest>=8.3.2",

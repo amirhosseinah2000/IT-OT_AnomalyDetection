@@ -18,18 +18,37 @@ data/raw/attack/labels/<protocol>/*.csv
 ```powershell
 uv sync
 uv run anomaly dataset inspect
-uv run anomaly dataset run --max-packets 5000
+$RUN = "artifacts/runs/first-pass"
+uv run anomaly dataset extract --output "$RUN" --max-packets 5000
+uv run anomaly dataset map "$RUN"
 uv run anomaly select create dns-compact --protocols dns --features "packet_length,payload_size,payload_entropy,dns_rcode"
-uv run anomaly two-stage train artifacts/runs/<dataset-run> --protocol dns --profile dns-compact
+uv run anomaly two-stage train "$RUN" --protocol dns --profile dns-compact
 uv run anomaly dashboard
 ```
 
-`dataset run` keeps every protocol/capture in a separate Parquet file, verifies label mappings using shared endpoint/time evidence (including automatically audited clock offsets), and writes a portable `catalog/artifacts.parquet`. CSV fields never become model features.
+`dataset extract` keeps every protocol/capture in a separate Parquet file. `dataset map` then uses only those saved feature files to verify label mappings using shared endpoint/time evidence (including automatically audited clock offsets), creates the reusable packet-to-CSV relation, and writes a portable `catalog/artifacts.parquet`. CSV fields never become model features. `dataset run` remains the equivalent one-command convenience path.
+
+For a complete large archive, use the disk-backed streaming path instead of a
+multi-million-packet in-memory run:
+
+```powershell
+$RUN = "artifacts/runs/final"
+uv run anomaly --config config/production-streaming.yaml dataset extract --output "$RUN" --all-packets
+uv run anomaly --config config/production-streaming.yaml dataset map "$RUN"
+```
+
+It writes fixed-size Parquet row groups per protocol/capture. The separate map
+step labels those stored records in batches, and model fitting stays bounded by
+`models.max_source_rows`.
 
 See the two Persian operational guides:
 
 - [Using the module](guides/USING_THE_MODULE_FA.md)
 - [Adding a protocol](guides/ADDING_A_PROTOCOL_FA.md)
+
+For a file-by-file map of the repository, generated artifacts, and execution
+boundaries, see [Project structure (Persian)](guides/PROJECT_STRUCTURE_FA.md)
+or [Project structure (English)](guides/PROJECT_STRUCTURE_EN.md).
 
 ## Requirements
 

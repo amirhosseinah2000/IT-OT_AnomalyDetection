@@ -110,3 +110,19 @@ def test_lstm_autoencoder_scores_and_persists_history_when_torch_is_available(tm
     assert events[0]["event"] == "lstm_started"
     assert events[-1]["event"] == "lstm_completed"
     assert model.save(tmp_path / "model.pt").exists()
+
+
+def test_lstm_windows_never_cross_capture_boundaries() -> None:
+    """A PCAP boundary must not create a synthetic LSTM sequence."""
+    from anomdet.modelling.lstm_autoencoder import LSTMAutoencoder
+
+    values = np.arange(12, dtype=np.float32).reshape(6, 2)
+    groups = np.asarray(["first.pcap"] * 3 + ["second.pcap"] * 3, dtype=object)
+    model = LSTMAutoencoder(sequence_length=4, sequence_stride=4)
+
+    windows, references = model._grouped_windows(values, groups)
+
+    assert windows.shape == (2, 4, 2)
+    assert all(len(set(groups[reference])) == 1 for reference in references)
+    assert np.array_equal(references[0], np.asarray([0, 1, 2, 2]))
+    assert np.array_equal(references[1], np.asarray([3, 4, 5, 5]))
